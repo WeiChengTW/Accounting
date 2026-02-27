@@ -2,6 +2,7 @@ import sqlite3
 import re
 from datetime import datetime, timedelta, timezone
 import os
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from flask import Flask, request, abort
 
@@ -28,6 +29,66 @@ def resolve_db_path():
 
 
 def resolve_database_url():
+    def sanitize_postgres_url(raw_url):
+        db_url = raw_url.strip().strip('"').strip("'")
+        if not db_url:
+            return None
+
+        parsed = urlparse(db_url)
+        if parsed.scheme not in {"postgres", "postgresql"}:
+            return db_url
+
+        allowed_query_keys = {
+            "application_name",
+            "channel_binding",
+            "connect_timeout",
+            "gssencmode",
+            "keepalives",
+            "keepalives_count",
+            "keepalives_idle",
+            "keepalives_interval",
+            "options",
+            "passfile",
+            "service",
+            "sslcert",
+            "sslkey",
+            "sslmode",
+            "sslpassword",
+            "sslrootcert",
+            "target_session_attrs",
+        }
+        filtered_query = urlencode(
+            [
+                (key, value)
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if key in allowed_query_keys
+            ],
+            doseq=True,
+        )
+        return urlunparse(parsed._replace(query=filtered_query))
+
+    def build_postgres_url_from_components():
+        host = (os.getenv("DATABASE_POSTGRES_HOST") or "").strip()
+        user = (os.getenv("DATABASE_POSTGRES_USER") or "").strip()
+        password = (os.getenv("DATABASE_POSTGRES_PASSWORD") or "").strip()
+        database = (os.getenv("DATABASE_POSTGRES_DATABASE") or "").strip() or "postgres"
+        port = (os.getenv("DATABASE_POSTGRES_PORT") or "").strip() or "5432"
+
+        if not host or not user or not password:
+            return None
+
+        if ":" in host and not os.getenv("DATABASE_POSTGRES_PORT"):
+            host_part = host
+        else:
+            host_part = f"{host}:{port}"
+
+        return (
+            "postgresql://"
+            f"{quote(user, safe='')}:{quote(password, safe='')}@"
+            f"{host_part}/{quote(database, safe='')}"
+            "?sslmode=require"
+        )
+
     for env_key in (
         "DATABASE_URL",
         "DATABASE_POSTGRES_URL",
@@ -46,7 +107,12 @@ def resolve_database_url():
     ):
         env_value = os.getenv(env_key)
         if env_value and env_value.strip():
-            return env_value.strip(), env_key
+            return sanitize_postgres_url(env_value), env_key
+
+    component_url = build_postgres_url_from_components()
+    if component_url:
+        return component_url, "DATABASE_POSTGRES_*"
+
     return None, None
 
 
