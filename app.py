@@ -76,38 +76,72 @@ def parse_record_message(text):
             microsecond=0,
         )
 
-    if len(lines) != 1:
-        raise ValueError("格式錯誤，請用單行：@記帳 項目 金額 [支出或收入] [MM/DD]")
+    command_keywords = {
+        "刪除",
+        "修改",
+        "查詢",
+        "總覽",
+        "餘額",
+        "查餘額",
+        "範圍查詢",
+        "詳細查詢",
+        "明細",
+        "詳細",
+        "格式",
+    }
 
-    parts = lines[0].split()
-    if len(parts) < 3 or len(parts) > 5:
-        raise ValueError("格式錯誤，請用單行：@記帳 項目 金額 [支出或收入] [MM/DD]")
+    parsed_records = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.startswith("@記帳"):
+            raise ValueError(
+                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD]"
+            )
 
-    item = parts[1]
-    amount_text = parts[2]
-    record_type = "支出"
-    record_datetime = datetime.now().replace(microsecond=0)
+        payload = line[len("@記帳") :].strip()
+        fields = [field for field in re.split(r"[\s,，]+", payload) if field]
+        if len(fields) < 2 or len(fields) > 4:
+            raise ValueError(
+                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD]（分隔可用空白/，/,）"
+            )
 
-    if len(parts) == 4:
+        item = fields[0]
+        amount_text = fields[1]
+        option_1 = fields[2] if len(fields) >= 3 else None
+        option_2 = fields[3] if len(fields) >= 4 else None
+
+        if item in command_keywords:
+            raise ValueError(
+                "多行輸入僅支援記帳格式：@記帳 項目 金額 [支出或收入] [MM/DD]（分隔可用空白/，/,）"
+            )
+
+        if not item:
+            raise ValueError(f"第{line_number}行格式錯誤，項目不可空白")
+
+        record_type = "支出"
+        record_datetime = datetime.now().replace(microsecond=0)
+
+        if option_1 and not option_2:
+            try:
+                record_type = normalize_record_type(option_1)
+            except ValueError:
+                record_datetime = parse_mmdd_date(option_1)
+
+        if option_1 and option_2:
+            record_type = normalize_record_type(option_1)
+            record_datetime = parse_mmdd_date(option_2)
+
         try:
-            record_type = normalize_record_type(parts[3])
-        except ValueError:
-            record_datetime = parse_mmdd_date(parts[3])
+            amount = int(amount_text)
+            if amount <= 0:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError(
+                f"第{line_number}行金額錯誤，金額必須是正整數，例如：@記帳 銀行，50000 收入"
+            ) from exc
 
-    if len(parts) == 5:
-        record_type = normalize_record_type(parts[3])
-        record_datetime = parse_mmdd_date(parts[4])
+        parsed_records.append((item, amount, record_type, record_datetime))
 
-    try:
-        amount = int(amount_text)
-        if amount <= 0:
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError(
-            "金額必須是正整數，欄位請用空格分開，例如：@記帳 銀行 50000 收入"
-        ) from exc
-
-    return item, amount, record_type, record_datetime
+    return parsed_records
 
 
 def normalize_record_type_input(type_input):
@@ -137,7 +171,7 @@ def parse_mmdd_date_input(date_text):
 
 
 def parse_modify_command(text):
-    parts = text.split()
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
     if len(parts) < 5 or parts[0] != "@記帳" or parts[1] != "修改":
         return None
 
@@ -146,7 +180,9 @@ def parse_modify_command(text):
         if record_id <= 0:
             raise ValueError
     except ValueError as exc:
-        raise ValueError("修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]") from exc
+        raise ValueError(
+            "修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]（分隔可用空白/，/,）"
+        ) from exc
 
     item = parts[3]
     amount_text = parts[4]
@@ -160,7 +196,9 @@ def parse_modify_command(text):
 
     option_parts = parts[5:]
     if len(option_parts) > 2:
-        raise ValueError("修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]")
+        raise ValueError(
+            "修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]（分隔可用空白/，/,）"
+        )
 
     record_type = None
     record_datetime = None
@@ -182,6 +220,21 @@ def parse_modify_command(text):
         "record_type": record_type,
         "record_datetime": record_datetime,
     }
+
+
+def parse_delete_command(text):
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
+    if len(parts) != 3 or parts[0] != "@記帳" or parts[1] != "刪除":
+        return None
+
+    try:
+        record_id = int(parts[2])
+        if record_id <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("刪除格式：@記帳 刪除 ID（分隔可用空白/，/,）") from exc
+
+    return record_id
 
 
 def save_record(user_id, chat_id, item, amount, record_type, created_at):
@@ -208,12 +261,31 @@ def get_record_by_id(chat_id, record_id):
     return row
 
 
-def format_record_detail_for_delete(record_row):
-    record_id, item, amount, record_type, created_at = record_row
+def get_record_by_display_id(chat_id, display_id):
+    if display_id <= 0:
+        return None
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, item, amount, record_type, created_at
+            FROM records
+            WHERE chat_id = ?
+            ORDER BY id ASC
+            LIMIT 1 OFFSET ?
+            """,
+            (chat_id, display_id - 1),
+        ).fetchone()
+
+    return row
+
+
+def format_record_detail_for_delete(display_id, record_row):
+    _, item, amount, record_type, created_at = record_row
     created_at_text = datetime.fromisoformat(created_at).strftime("%Y/%m/%d")
     return (
         f"即將刪除以下紀錄：\n"
-        f"ID：{record_id}\n"
+        f"ID：{display_id}\n"
         f"日期：{created_at_text}\n"
         f"類型：{record_type}\n"
         f"項目：{item}\n"
@@ -548,10 +620,20 @@ def get_detailed_records(chat_id, range_spec, limit=30):
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             f"""
-            SELECT id, created_at, item, amount, user_id
-            FROM records
+            SELECT
+                r.id,
+                r.created_at,
+                r.item,
+                r.amount,
+                r.user_id,
+                (
+                    SELECT COUNT(*)
+                    FROM records AS seq
+                    WHERE seq.chat_id = r.chat_id AND seq.id <= r.id
+                ) AS display_id
+            FROM records AS r
             WHERE {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY r.created_at DESC, r.id DESC
             LIMIT ?
             """,
             [*params, limit],
@@ -602,7 +684,7 @@ def build_detail_text(chat_id, event_source, range_spec):
     use_month_day_format = scope in {"日", "周", "月"}
     shown_year = None
 
-    for record_id, created_at, item, amount, user_id in rows:
+    for _, created_at, item, amount, user_id, display_id in rows:
         created_at_dt = datetime.fromisoformat(created_at)
 
         if use_month_day_format:
@@ -615,7 +697,7 @@ def build_detail_text(chat_id, event_source, range_spec):
             created_at_text = created_at_dt.strftime("%Y/%m/%d")
 
         display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"ID：{record_id}　日期：{created_at_text}")
+        lines.append(f"ID：{display_id}　日期：{created_at_text}")
         lines.append(f"項目：{item}")
         lines.append(f"金額：{amount}　登記人：{display_name}")
         lines.append("-")
@@ -624,7 +706,7 @@ def build_detail_text(chat_id, event_source, range_spec):
 
 
 def parse_query_command(text):
-    parts = text.split()
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
     if not parts or parts[0] != "@記帳":
         return None
 
@@ -673,14 +755,14 @@ def handle_message(event):
     chat_id = get_chat_id(event.source)
 
     confirm_keywords = {"確定", "確認", "ok", "OK", "Ok", "好"}
-    pending_record_id = PENDING_DELETE.get(chat_id)
-    if pending_record_id is not None:
+    pending_delete = PENDING_DELETE.get(chat_id)
+    if pending_delete is not None:
         if incoming_text in confirm_keywords:
-            deleted_count = delete_record_by_id(chat_id, pending_record_id)
+            deleted_count = delete_record_by_id(chat_id, pending_delete["real_id"])
             if deleted_count == 0:
-                reply_text = f"找不到可刪除的紀錄 ID：{pending_record_id}"
+                reply_text = f"找不到可刪除的紀錄 ID：{pending_delete['display_id']}"
             else:
-                reply_text = f"已刪除紀錄 ID：{pending_record_id}"
+                reply_text = f"已刪除紀錄 ID：{pending_delete['display_id']}"
 
             PENDING_DELETE.pop(chat_id, None)
             line_bot_api.reply_message(
@@ -697,20 +779,28 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n-\n刪除：\n@記帳 刪除 ID\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n-\n查詢：\n@記帳 查詢 [範圍]\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
 
-    delete_match = re.fullmatch(r"@記帳\s+刪除\s+(\d+)", incoming_text)
-    if delete_match:
-        record_id = int(delete_match.group(1))
-        record = get_record_by_id(chat_id, record_id)
+    try:
+        delete_record_id = parse_delete_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if delete_record_id is not None:
+        display_record_id = delete_record_id
+        record = get_record_by_display_id(chat_id, display_record_id)
         if not record:
-            reply_text = f"找不到可刪除的紀錄 ID：{record_id}"
+            reply_text = f"找不到可刪除的紀錄 ID：{display_record_id}"
         else:
-            PENDING_DELETE[chat_id] = record_id
-            reply_text = format_record_detail_for_delete(record)
+            PENDING_DELETE[chat_id] = {
+                "real_id": record[0],
+                "display_id": display_record_id,
+            }
+            reply_text = format_record_detail_for_delete(display_record_id, record)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
 
@@ -721,16 +811,16 @@ def handle_message(event):
         return
 
     if modify_command:
-        record_id = modify_command["record_id"]
-        old_record = get_record_by_id(chat_id, record_id)
+        display_record_id = modify_command["record_id"]
+        old_record = get_record_by_display_id(chat_id, display_record_id)
         if not old_record:
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"找不到可修改的紀錄 ID：{record_id}"),
+                TextSendMessage(text=f"找不到可修改的紀錄 ID：{display_record_id}"),
             )
             return
 
-        _, _, _, old_record_type, old_created_at = old_record
+        real_record_id, _, _, old_record_type, old_created_at = old_record
         record_type = modify_command["record_type"] or old_record_type
         record_datetime = (
             modify_command["record_datetime"]
@@ -740,17 +830,17 @@ def handle_message(event):
 
         updated_count = update_record_by_id(
             chat_id=chat_id,
-            record_id=record_id,
+            record_id=real_record_id,
             item=modify_command["item"],
             amount=modify_command["amount"],
             record_type=record_type,
             created_at=record_datetime,
         )
         if updated_count == 0:
-            reply_text = f"找不到可修改的紀錄 ID：{record_id}"
+            reply_text = f"找不到可修改的紀錄 ID：{display_record_id}"
         else:
             reply_text = (
-                f"已修改紀錄 ID：{record_id}\n"
+                f"已修改紀錄 ID：{display_record_id}\n"
                 f"類型：{record_type}\n"
                 f"項目：{modify_command['item']}\n"
                 f"金額：{modify_command['amount']}"
@@ -786,23 +876,27 @@ def handle_message(event):
     if not parsed:
         return
 
-    item, amount, record_type, record_datetime = parsed
     user_id = getattr(event.source, "user_id", "unknown")
-    save_record(
-        user_id=user_id,
-        chat_id=chat_id,
-        item=item,
-        amount=amount,
-        record_type=record_type,
-        created_at=record_datetime,
-    )
+    for item, amount, record_type, record_datetime in parsed:
+        save_record(
+            user_id=user_id,
+            chat_id=chat_id,
+            item=item,
+            amount=amount,
+            record_type=record_type,
+            created_at=record_datetime,
+        )
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(
-            text=f"記帳成功\n類型：{record_type}\n項目：{item}\n金額：{amount}"
-        ),
-    )
+    if len(parsed) == 1:
+        item, amount, record_type, _ = parsed[0]
+        reply_text = f"記帳成功\n類型：{record_type}\n項目：{item}\n金額：{amount}"
+    else:
+        summary_lines = [f"記帳成功（共{len(parsed)}筆）"]
+        for index, (item, amount, record_type, _) in enumerate(parsed, start=1):
+            summary_lines.append(f"{index}. {record_type} {item} {amount}")
+        reply_text = "\n".join(summary_lines)
+
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
 
 if __name__ == "__main__":
