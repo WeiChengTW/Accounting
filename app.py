@@ -1,6 +1,7 @@
 import sqlite3
 import re
 from datetime import datetime, timedelta
+import os
 
 from flask import Flask, request, abort
 
@@ -13,10 +14,21 @@ from linebot.models import (
 )
 
 app = Flask(__name__)
-DB_PATH = "bookkeeping.db"
-PENDING_DELETE = {}
 
-import os
+
+def resolve_db_path():
+    env_db_path = os.getenv("DB_PATH")
+    if env_db_path:
+        return env_db_path
+
+    if os.getenv("VERCEL") == "1" or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+        return "/tmp/bookkeeping.db"
+
+    return "bookkeeping.db"
+
+
+DB_PATH = resolve_db_path()
+PENDING_DELETE = {}
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
