@@ -58,9 +58,10 @@ PENDING_DELETE = {}
 if (
     os.getenv("VERCEL") == "1" or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
 ) and not IS_POSTGRES:
-    raise RuntimeError(
-        "目前在雲端環境執行，但未設定 Postgres 連線字串。"
-        "請至少設定一個環境變數：DATABASE_URL / SUPABASE_DB_URL / POSTGRES_URL"
+    print(
+        "[WARN] 目前在雲端環境執行，但未設定 Postgres 連線字串。"
+        "將暫時使用 SQLite（/tmp），資料不保證持久化。"
+        "建議設定：DATABASE_URL / SUPABASE_DB_URL / POSTGRES_URL"
     )
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
