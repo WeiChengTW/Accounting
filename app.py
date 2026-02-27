@@ -28,13 +28,91 @@ def resolve_db_path():
 
 
 DB_PATH = resolve_db_path()
+DATABASE_URL = os.getenv("DATABASE_URL")
+IS_POSTGRES = bool(DATABASE_URL)
+psycopg = None
 PENDING_DELETE = {}
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
 
+def to_db_created_at(created_at):
+    if IS_POSTGRES:
+        return created_at
+    return created_at.isoformat()
+
+
+def from_db_created_at(created_at_value):
+    if isinstance(created_at_value, datetime):
+        return created_at_value.replace(microsecond=0)
+    return datetime.fromisoformat(created_at_value)
+
+
+def adapt_query(query):
+    if IS_POSTGRES:
+        return query.replace("?", "%s")
+    return query
+
+
+def run_query(query, params=(), fetch_mode=None):
+    global psycopg
+    adapted_query = adapt_query(query)
+
+    if IS_POSTGRES:
+        if psycopg is None:
+            try:
+                import importlib
+
+                psycopg = importlib.import_module("psycopg")
+            except ImportError as exc:
+                raise RuntimeError(
+                    "DATABASE_URL 已設定，但缺少 psycopg 套件，請安裝 requirements.txt 依賴"
+                ) from exc
+
+        if psycopg is None:
+            raise RuntimeError(
+                "DATABASE_URL 已設定，但缺少 psycopg 套件，請安裝 requirements.txt 依賴"
+            )
+
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(adapted_query, params)
+                if fetch_mode == "one":
+                    return cur.fetchone()
+                if fetch_mode == "all":
+                    return cur.fetchall()
+                return cur.rowcount
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(adapted_query, params)
+        if fetch_mode == "one":
+            return cur.fetchone()
+        if fetch_mode == "all":
+            return cur.fetchall()
+        return cur.rowcount
+
+
 def init_db():
+    if IS_POSTGRES:
+        run_query(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id BIGSERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT 'unknown',
+                item TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        run_query(
+            "ALTER TABLE records ADD COLUMN IF NOT EXISTS chat_id TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        return
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -338,26 +416,25 @@ def parse_delete_command(text):
 
 
 def save_record(user_id, chat_id, item, amount, record_type, created_at):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO records (user_id, chat_id, item, amount, record_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, chat_id, item, amount, record_type, created_at.isoformat()),
-        )
+    run_query(
+        """
+        INSERT INTO records (user_id, chat_id, item, amount, record_type, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, chat_id, item, amount, record_type, to_db_created_at(created_at)),
+    )
 
 
 def get_record_by_id(chat_id, record_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            """
-            SELECT id, item, amount, record_type, created_at
-            FROM records
-            WHERE chat_id = ? AND id = ?
-            """,
-            (chat_id, record_id),
-        ).fetchone()
+    row = run_query(
+        """
+        SELECT id, item, amount, record_type, created_at
+        FROM records
+        WHERE chat_id = ? AND id = ?
+        """,
+        (chat_id, record_id),
+        fetch_mode="one",
+    )
     return row
 
 
@@ -365,24 +442,24 @@ def get_record_by_display_id(chat_id, display_id):
     if display_id <= 0:
         return None
 
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            """
-            SELECT id, item, amount, record_type, created_at
-            FROM records
-            WHERE chat_id = ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1 OFFSET ?
-            """,
-            (chat_id, display_id - 1),
-        ).fetchone()
+    row = run_query(
+        """
+        SELECT id, item, amount, record_type, created_at
+        FROM records
+        WHERE chat_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1 OFFSET ?
+        """,
+        (chat_id, display_id - 1),
+        fetch_mode="one",
+    )
 
     return row
 
 
 def format_record_detail_for_delete(display_id, record_row):
     _, item, amount, record_type, created_at = record_row
-    created_at_text = datetime.fromisoformat(created_at).strftime("%Y/%m/%d")
+    created_at_text = from_db_created_at(created_at).strftime("%Y/%m/%d")
     return (
         f"即將刪除以下紀錄：\n"
         f"ID：{display_id}\n"
@@ -395,25 +472,21 @@ def format_record_detail_for_delete(display_id, record_row):
 
 
 def delete_record_by_id(chat_id, record_id):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            "DELETE FROM records WHERE chat_id = ? AND id = ?",
-            (chat_id, record_id),
-        )
-        return cursor.rowcount
+    return run_query(
+        "DELETE FROM records WHERE chat_id = ? AND id = ?",
+        (chat_id, record_id),
+    )
 
 
 def update_record_by_id(chat_id, record_id, item, amount, record_type, created_at):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            UPDATE records
-            SET item = ?, amount = ?, record_type = ?, created_at = ?
-            WHERE chat_id = ? AND id = ?
-            """,
-            (item, amount, record_type, created_at.isoformat(), chat_id, record_id),
-        )
-        return cursor.rowcount
+    return run_query(
+        """
+        UPDATE records
+        SET item = ?, amount = ?, record_type = ?, created_at = ?
+        WHERE chat_id = ? AND id = ?
+        """,
+        (item, amount, record_type, to_db_created_at(created_at), chat_id, record_id),
+    )
 
 
 def get_chat_id(event_source):
@@ -675,32 +748,34 @@ def get_balance_summary(chat_id, range_spec):
     params = [chat_id]
     if range_start is not None:
         where_clause += " AND created_at >= ?"
-        params.append(range_start.isoformat())
+        params.append(to_db_created_at(range_start))
     if range_end is not None:
         where_clause += " AND created_at < ?"
-        params.append(range_end.isoformat())
+        params.append(to_db_created_at(range_end))
 
-    with sqlite3.connect(DB_PATH) as conn:
-        total_expense = conn.execute(
-            f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '支出'",
-            params,
-        ).fetchone()[0]
+    total_expense = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '支出'",
+        params,
+        fetch_mode="one",
+    )[0]
 
-        total_income = conn.execute(
-            f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '收入'",
-            params,
-        ).fetchone()[0]
+    total_income = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '收入'",
+        params,
+        fetch_mode="one",
+    )[0]
 
-        paid_by_user_rows = conn.execute(
-            f"""
-            SELECT user_id, COALESCE(SUM(amount), 0) AS paid
-            FROM records
-            WHERE {where_clause} AND record_type = '支出'
-            GROUP BY user_id
-            ORDER BY paid DESC
-            """,
-            params,
-        ).fetchall()
+    paid_by_user_rows = run_query(
+        f"""
+        SELECT user_id, COALESCE(SUM(amount), 0) AS paid
+        FROM records
+        WHERE {where_clause} AND record_type = '支出'
+        GROUP BY user_id
+        ORDER BY paid DESC
+        """,
+        params,
+        fetch_mode="all",
+    )
 
     return total_expense, total_income, paid_by_user_rows
 
@@ -712,36 +787,36 @@ def get_detailed_records(chat_id, range_spec, limit=30):
     params = [chat_id]
     if range_start is not None:
         where_clause += " AND created_at >= ?"
-        params.append(range_start.isoformat())
+        params.append(to_db_created_at(range_start))
     if range_end is not None:
         where_clause += " AND created_at < ?"
-        params.append(range_end.isoformat())
+        params.append(to_db_created_at(range_end))
 
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            f"""
-            SELECT
-                r.id,
-                r.created_at,
-                r.item,
-                r.amount,
-                r.user_id,
-                (
-                    SELECT COUNT(*)
-                    FROM records AS seq
-                    WHERE seq.chat_id = r.chat_id
-                      AND (
-                          seq.created_at > r.created_at
-                          OR (seq.created_at = r.created_at AND seq.id >= r.id)
-                      )
-                ) AS display_id
-            FROM records AS r
-            WHERE {where_clause}
-            ORDER BY r.created_at DESC, r.id DESC
-            LIMIT ?
-            """,
-            [*params, limit],
-        ).fetchall()
+    rows = run_query(
+        f"""
+        SELECT
+            r.id,
+            r.created_at,
+            r.item,
+            r.amount,
+            r.user_id,
+            (
+                SELECT COUNT(*)
+                FROM records AS seq
+                WHERE seq.chat_id = r.chat_id
+                  AND (
+                      seq.created_at > r.created_at
+                      OR (seq.created_at = r.created_at AND seq.id >= r.id)
+                  )
+            ) AS display_id
+        FROM records AS r
+        WHERE {where_clause}
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT ?
+        """,
+        [*params, limit],
+        fetch_mode="all",
+    )
 
     return rows
 
@@ -788,7 +863,7 @@ def build_detail_text(chat_id, event_source, range_spec):
     shown_year = None
 
     for _, created_at, item, amount, user_id, display_id in rows:
-        created_at_dt = datetime.fromisoformat(created_at)
+        created_at_dt = from_db_created_at(created_at)
 
         if use_month_day_format:
             current_year = created_at_dt.year
@@ -938,7 +1013,7 @@ def handle_message(event):
         record_datetime = (
             modify_command["record_datetime"]
             if modify_command["record_datetime"] is not None
-            else datetime.fromisoformat(old_created_at)
+            else from_db_created_at(old_created_at)
         )
 
         updated_count = update_record_by_id(
