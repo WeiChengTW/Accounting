@@ -31,15 +31,20 @@ def resolve_database_url():
     for env_key in (
         "DATABASE_URL",
         "SUPABASE_DB_URL",
+        "SUPABASE_DB_URI",
         "SUPABASE_DATABASE_URL",
+        "SUPABASE_DATABASE_URI",
+        "SUPABASE_POOLER_URL",
+        "SUPABASE_POOL_URL",
         "POSTGRES_URL",
+        "POSTGRESQL_URL",
         "POSTGRES_PRISMA_URL",
         "POSTGRES_URL_NON_POOLING",
     ):
         env_value = os.getenv(env_key)
-        if env_value:
-            return env_value
-    return None
+        if env_value and env_value.strip():
+            return env_value.strip(), env_key
+    return None, None
 
 
 APP_TIMEZONE = timezone(timedelta(hours=8))
@@ -50,19 +55,53 @@ def get_now():
 
 
 DB_PATH = resolve_db_path()
-DATABASE_URL = resolve_database_url()
+DATABASE_URL, DATABASE_URL_SOURCE = resolve_database_url()
 IS_POSTGRES = bool(DATABASE_URL)
+IS_SERVERLESS = os.getenv("VERCEL") == "1" or bool(
+    os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+)
+USING_EPHEMERAL_SQLITE = IS_SERVERLESS and not IS_POSTGRES
 psycopg = None
 PENDING_DELETE = {}
 
-if (
-    os.getenv("VERCEL") == "1" or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
-) and not IS_POSTGRES:
+if USING_EPHEMERAL_SQLITE:
     print(
         "[WARN] 目前在雲端環境執行，但未設定 Postgres 連線字串。"
         "將暫時使用 SQLite（/tmp），資料不保證持久化。"
         "建議設定：DATABASE_URL / SUPABASE_DB_URL / POSTGRES_URL"
     )
+
+
+def with_storage_warning(text):
+    if not USING_EPHEMERAL_SQLITE:
+        return text
+    return (
+        f"{text}\n\n"
+        "⚠️目前為雲端臨時資料庫模式（SQLite /tmp），可能在幾分鐘後清空。"
+        "請設定 DATABASE_URL（Supabase Postgres）以持久保存。"
+    )
+
+
+def build_storage_status_text():
+    lines = ["記帳系統狀態"]
+
+    if IS_POSTGRES:
+        lines.append("資料庫：Postgres（持久化）")
+        if DATABASE_URL_SOURCE:
+            lines.append(f"連線來源：{DATABASE_URL_SOURCE}")
+        else:
+            lines.append("連線來源：已設定（來源未知）")
+    else:
+        lines.append("資料庫：SQLite")
+        lines.append(f"資料檔：{DB_PATH}")
+        if USING_EPHEMERAL_SQLITE:
+            lines.append("模式：雲端臨時（可能重置）")
+        else:
+            lines.append("模式：本機")
+
+    lines.append("時區：Asia/Taipei (UTC+8)")
+    return "\n".join(lines)
+
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
@@ -919,6 +958,9 @@ def parse_query_command(text):
         range_spec = parse_range_spec(parts[2:], "月")
         return "detail", range_spec
 
+    if len(parts) >= 2 and parts[1] in {"狀態", "status", "STATUS"}:
+        return "status", None
+
     return None
 
 
@@ -976,7 +1018,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
@@ -1068,10 +1110,14 @@ def handle_message(event):
 
     if query_command:
         command_type, range_spec = query_command
-        if command_type == "summary":
+        if command_type == "status":
+            reply_text = build_storage_status_text()
+        elif command_type == "summary":
             reply_text = build_summary_text(chat_id, event.source, range_spec)
         else:
             reply_text = build_detail_text(chat_id, event.source, range_spec)
+
+        reply_text = with_storage_warning(reply_text)
 
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
@@ -1104,6 +1150,8 @@ def handle_message(event):
         for index, (item, amount, record_type, _) in enumerate(parsed, start=1):
             summary_lines.append(f"{index}. {record_type} {item} {amount}")
         reply_text = "\n".join(summary_lines)
+
+    reply_text = with_storage_warning(reply_text)
 
     line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
 
