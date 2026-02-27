@@ -1,0 +1,810 @@
+import sqlite3
+import re
+from datetime import datetime, timedelta
+
+from flask import Flask, request, abort
+
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
+from linebot.models import (
+    MessageEvent,
+    TextMessage,
+    TextSendMessage,
+)
+
+app = Flask(__name__)
+DB_PATH = "bookkeeping.db"
+PENDING_DELETE = {}
+
+import os
+
+line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
+line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT 'unknown',
+                item TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()
+        }
+        if "chat_id" not in columns:
+            conn.execute(
+                "ALTER TABLE records ADD COLUMN chat_id TEXT NOT NULL DEFAULT 'unknown'"
+            )
+
+
+def parse_record_message(text):
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines or not lines[0].startswith("@記帳"):
+        return None
+
+    def normalize_record_type(type_input):
+        if type_input in {"支出", "expense", "Expense", "EXPENSE"}:
+            return "支出"
+        if type_input in {"收入", "income", "Income", "INCOME"}:
+            return "收入"
+        raise ValueError("收支類型只能填：支出 或 收入")
+
+    def parse_mmdd_date(date_text):
+        try:
+            parsed = datetime.strptime(date_text, "%m/%d")
+        except ValueError as exc:
+            raise ValueError("日期格式請用 MM/DD，例如 02/27") from exc
+
+        now = datetime.now()
+        return datetime(
+            year=now.year,
+            month=parsed.month,
+            day=parsed.day,
+            hour=now.hour,
+            minute=now.minute,
+            second=now.second,
+            microsecond=0,
+        )
+
+    if len(lines) != 1:
+        raise ValueError("格式錯誤，請用單行：@記帳 項目 金額 [支出或收入] [MM/DD]")
+
+    parts = lines[0].split()
+    if len(parts) < 3 or len(parts) > 5:
+        raise ValueError("格式錯誤，請用單行：@記帳 項目 金額 [支出或收入] [MM/DD]")
+
+    item = parts[1]
+    amount_text = parts[2]
+    record_type = "支出"
+    record_datetime = datetime.now().replace(microsecond=0)
+
+    if len(parts) == 4:
+        try:
+            record_type = normalize_record_type(parts[3])
+        except ValueError:
+            record_datetime = parse_mmdd_date(parts[3])
+
+    if len(parts) == 5:
+        record_type = normalize_record_type(parts[3])
+        record_datetime = parse_mmdd_date(parts[4])
+
+    try:
+        amount = int(amount_text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            "金額必須是正整數，欄位請用空格分開，例如：@記帳 銀行 50000 收入"
+        ) from exc
+
+    return item, amount, record_type, record_datetime
+
+
+def normalize_record_type_input(type_input):
+    if type_input in {"支出", "expense", "Expense", "EXPENSE"}:
+        return "支出"
+    if type_input in {"收入", "income", "Income", "INCOME"}:
+        return "收入"
+    raise ValueError("收支類型只能填：支出 或 收入")
+
+
+def parse_mmdd_date_input(date_text):
+    try:
+        parsed = datetime.strptime(date_text, "%m/%d")
+    except ValueError as exc:
+        raise ValueError("日期格式請用 MM/DD，例如 02/27") from exc
+
+    now = datetime.now()
+    return datetime(
+        year=now.year,
+        month=parsed.month,
+        day=parsed.day,
+        hour=now.hour,
+        minute=now.minute,
+        second=now.second,
+        microsecond=0,
+    )
+
+
+def parse_modify_command(text):
+    parts = text.split()
+    if len(parts) < 5 or parts[0] != "@記帳" or parts[1] != "修改":
+        return None
+
+    try:
+        record_id = int(parts[2])
+        if record_id <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]") from exc
+
+    item = parts[3]
+    amount_text = parts[4]
+
+    try:
+        amount = int(amount_text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("金額必須是正整數") from exc
+
+    option_parts = parts[5:]
+    if len(option_parts) > 2:
+        raise ValueError("修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]")
+
+    record_type = None
+    record_datetime = None
+
+    if len(option_parts) == 1:
+        try:
+            record_type = normalize_record_type_input(option_parts[0])
+        except ValueError:
+            record_datetime = parse_mmdd_date_input(option_parts[0])
+
+    if len(option_parts) == 2:
+        record_type = normalize_record_type_input(option_parts[0])
+        record_datetime = parse_mmdd_date_input(option_parts[1])
+
+    return {
+        "record_id": record_id,
+        "item": item,
+        "amount": amount,
+        "record_type": record_type,
+        "record_datetime": record_datetime,
+    }
+
+
+def save_record(user_id, chat_id, item, amount, record_type, created_at):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO records (user_id, chat_id, item, amount, record_type, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, chat_id, item, amount, record_type, created_at.isoformat()),
+        )
+
+
+def get_record_by_id(chat_id, record_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, item, amount, record_type, created_at
+            FROM records
+            WHERE chat_id = ? AND id = ?
+            """,
+            (chat_id, record_id),
+        ).fetchone()
+    return row
+
+
+def format_record_detail_for_delete(record_row):
+    record_id, item, amount, record_type, created_at = record_row
+    created_at_text = datetime.fromisoformat(created_at).strftime("%Y/%m/%d")
+    return (
+        f"即將刪除以下紀錄：\n"
+        f"ID：{record_id}\n"
+        f"日期：{created_at_text}\n"
+        f"類型：{record_type}\n"
+        f"項目：{item}\n"
+        f"金額：{amount}\n"
+        f"請回覆「確認」後刪除"
+    )
+
+
+def delete_record_by_id(chat_id, record_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM records WHERE chat_id = ? AND id = ?",
+            (chat_id, record_id),
+        )
+        return cursor.rowcount
+
+
+def update_record_by_id(chat_id, record_id, item, amount, record_type, created_at):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE records
+            SET item = ?, amount = ?, record_type = ?, created_at = ?
+            WHERE chat_id = ? AND id = ?
+            """,
+            (item, amount, record_type, created_at.isoformat(), chat_id, record_id),
+        )
+        return cursor.rowcount
+
+
+def get_chat_id(event_source):
+    group_id = getattr(event_source, "group_id", None)
+    if group_id:
+        return f"group:{group_id}"
+
+    room_id = getattr(event_source, "room_id", None)
+    if room_id:
+        return f"room:{room_id}"
+
+    user_id = getattr(event_source, "user_id", "unknown")
+    return f"user:{user_id}"
+
+
+def format_user_id(user_id):
+    if not user_id or user_id == "unknown":
+        return "未知使用者"
+    if len(user_id) <= 10:
+        return user_id
+    return f"{user_id[:6]}...{user_id[-4:]}"
+
+
+def resolve_display_name(event_source, user_id):
+    if not user_id or user_id == "unknown":
+        return "未知使用者"
+
+    source_type = getattr(event_source, "type", None)
+    group_id = getattr(event_source, "group_id", None)
+    room_id = getattr(event_source, "room_id", None)
+
+    try:
+        if source_type == "group" and group_id:
+            profile = line_bot_api.get_group_member_profile(group_id, user_id)
+            return profile.display_name
+
+        if source_type == "room" and room_id:
+            profile = line_bot_api.get_room_member_profile(room_id, user_id)
+            return profile.display_name
+
+        profile = line_bot_api.get_profile(user_id)
+        return profile.display_name
+    except LineBotApiError:
+        return format_user_id(user_id)
+
+
+def normalize_scope(scope_text, default_scope):
+    if not scope_text:
+        return default_scope
+
+    scope_map = {
+        "日": "日",
+        "天": "日",
+        "周": "周",
+        "週": "周",
+        "月": "月",
+        "年": "年",
+        "全部": "全部",
+        "all": "全部",
+        "ALL": "全部",
+    }
+
+    normalized = scope_map.get(scope_text)
+    if not normalized:
+        raise ValueError("範圍只能填：日、周、月、年、全部")
+
+    return normalized
+
+
+def parse_range_spec(range_parts, default_scope):
+    if not range_parts:
+        scope = normalize_scope(None, default_scope)
+        return {"type": "scope", "scope": scope, "label": scope}
+
+    if len(range_parts) == 1:
+        token = range_parts[0]
+
+        date_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})", token)
+        if date_match:
+            month = int(date_match.group(1))
+            day = int(date_match.group(2))
+            year = datetime.now().year
+            try:
+                datetime(year, month, day)
+            except ValueError as exc:
+                raise ValueError("日期格式請用 M/D 或 MM/DD，且需是有效日期") from exc
+
+            return {
+                "type": "date",
+                "year": year,
+                "month": month,
+                "day": day,
+                "label": f"{year}/{month:02d}/{day:02d}",
+            }
+
+        month_match = re.fullmatch(r"(\d{1,2})月", token)
+        if month_match:
+            month = int(month_match.group(1))
+            if month < 1 or month > 12:
+                raise ValueError("月份需介於 1 到 12")
+            year = datetime.now().year
+            return {
+                "type": "month_year",
+                "year": year,
+                "month": month,
+                "label": f"{year}年{month}月",
+            }
+
+        year_match = re.fullmatch(r"(\d{4})(?:年)?", token)
+        if year_match:
+            year = int(year_match.group(1))
+            return {
+                "type": "year_exact",
+                "year": year,
+                "label": f"{year}年",
+            }
+
+        scope = normalize_scope(token, default_scope)
+        return {"type": "scope", "scope": scope, "label": scope}
+
+    if len(range_parts) == 2:
+        month = None
+        year = None
+
+        for token in range_parts:
+            month_match = re.fullmatch(r"(\d{1,2})月", token)
+            year_match = re.fullmatch(r"(\d{4})(?:年)?", token)
+
+            if month_match:
+                month = int(month_match.group(1))
+                continue
+
+            if year_match:
+                year = int(year_match.group(1))
+                continue
+
+            raise ValueError(
+                "範圍格式錯誤，可用：日/周/月/年/全部，或 2月、2025、2月 2025年、2/25"
+            )
+
+        if not month or not year:
+            raise ValueError(
+                "範圍格式錯誤，可用：日/周/月/年/全部，或 2月、2025、2月 2025年、2/25"
+            )
+
+        if month < 1 or month > 12:
+            raise ValueError("月份需介於 1 到 12")
+
+        return {
+            "type": "month_year",
+            "year": year,
+            "month": month,
+            "label": f"{year}年{month}月",
+        }
+
+    raise ValueError("範圍參數過多")
+
+
+def parse_month_range_spec(range_parts):
+    if not range_parts:
+        raise ValueError(
+            "範圍查詢格式：@記帳 範圍查詢 起始月到結束月（例如：2月到5月）"
+        )
+
+    joined = "".join(range_parts)
+    match = re.fullmatch(r"(\d{1,2})月到(\d{1,2})月", joined)
+    if not match:
+        raise ValueError(
+            "範圍查詢格式：@記帳 範圍查詢 起始月到結束月（例如：2月到5月）"
+        )
+
+    start_month = int(match.group(1))
+    end_month = int(match.group(2))
+
+    if start_month < 1 or start_month > 12 or end_month < 1 or end_month > 12:
+        raise ValueError("月份需介於 1 到 12")
+
+    if start_month > end_month:
+        raise ValueError("起始月不可大於結束月")
+
+    year = datetime.now().year
+    return {
+        "type": "month_range",
+        "year": year,
+        "start_month": start_month,
+        "end_month": end_month,
+        "label": f"{start_month}月到{end_month}月",
+    }
+
+
+def get_scope_start_datetime(scope):
+    now = datetime.now()
+
+    if scope == "全部":
+        return None
+    if scope == "日":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scope == "周":
+        week_start = now - timedelta(days=now.weekday())
+        return week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if scope == "月":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if scope == "年":
+        return now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    return None
+
+
+def get_range_start_end(range_spec):
+    range_type = range_spec["type"]
+
+    if range_type == "scope":
+        scope = range_spec["scope"]
+        start = get_scope_start_datetime(scope)
+        return start, None
+
+    if range_type == "month_year":
+        year = range_spec["year"]
+        month = range_spec["month"]
+        start = datetime(year, month, 1)
+        if month == 12:
+            end = datetime(year + 1, 1, 1)
+        else:
+            end = datetime(year, month + 1, 1)
+        return start, end
+
+    if range_type == "date":
+        year = range_spec["year"]
+        month = range_spec["month"]
+        day = range_spec["day"]
+        start = datetime(year, month, day)
+        end = start + timedelta(days=1)
+        return start, end
+
+    if range_type == "month_range":
+        year = range_spec["year"]
+        start_month = range_spec["start_month"]
+        end_month = range_spec["end_month"]
+        start = datetime(year, start_month, 1)
+        if end_month == 12:
+            end = datetime(year + 1, 1, 1)
+        else:
+            end = datetime(year, end_month + 1, 1)
+        return start, end
+
+    if range_type == "year_exact":
+        year = range_spec["year"]
+        start = datetime(year, 1, 1)
+        end = datetime(year + 1, 1, 1)
+        return start, end
+
+    return None, None
+
+
+def get_balance_summary(chat_id, range_spec):
+    range_start, range_end = get_range_start_end(range_spec)
+
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(range_start.isoformat())
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(range_end.isoformat())
+
+    with sqlite3.connect(DB_PATH) as conn:
+        total_expense = conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '支出'",
+            params,
+        ).fetchone()[0]
+
+        total_income = conn.execute(
+            f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '收入'",
+            params,
+        ).fetchone()[0]
+
+        paid_by_user_rows = conn.execute(
+            f"""
+            SELECT user_id, COALESCE(SUM(amount), 0) AS paid
+            FROM records
+            WHERE {where_clause} AND record_type = '支出'
+            GROUP BY user_id
+            ORDER BY paid DESC
+            """,
+            params,
+        ).fetchall()
+
+    return total_expense, total_income, paid_by_user_rows
+
+
+def get_detailed_records(chat_id, range_spec, limit=30):
+    range_start, range_end = get_range_start_end(range_spec)
+
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(range_start.isoformat())
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(range_end.isoformat())
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, created_at, item, amount, user_id
+            FROM records
+            WHERE {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+
+    return rows
+
+
+def build_summary_text(chat_id, event_source, range_spec):
+    total_expense, total_income, paid_by_user_rows = get_balance_summary(
+        chat_id, range_spec
+    )
+    balance = total_income - total_expense
+
+    lines = [
+        f"記帳總覽（{range_spec['label']}）",
+        f"總收入：{total_income}",
+        f"總支出：{total_expense}",
+        f"目前餘額：{balance}",
+        "",
+        "誰目前付了多少：",
+    ]
+
+    if not paid_by_user_rows:
+        lines.append("尚無支出紀錄")
+    else:
+        for index, row in enumerate(paid_by_user_rows, start=1):
+            user_id, paid = row
+            display_name = resolve_display_name(event_source, user_id)
+            lines.append(f"{index}. {display_name}：{paid}")
+
+    return "\n".join(lines)
+
+
+def build_detail_text(chat_id, event_source, range_spec):
+    rows = get_detailed_records(chat_id, range_spec)
+    scope = range_spec["scope"] if range_spec["type"] == "scope" else "全部"
+
+    lines = [
+        f"記帳詳細（{range_spec['label']}）",
+        "每筆一段：",
+    ]
+
+    if not rows:
+        lines.append("該範圍尚無紀錄")
+        return "\n".join(lines)
+
+    use_month_day_format = scope in {"日", "周", "月"}
+    shown_year = None
+
+    for record_id, created_at, item, amount, user_id in rows:
+        created_at_dt = datetime.fromisoformat(created_at)
+
+        if use_month_day_format:
+            current_year = created_at_dt.year
+            if shown_year != current_year:
+                lines.append(f"【{current_year}】")
+                shown_year = current_year
+            created_at_text = created_at_dt.strftime("%m/%d")
+        else:
+            created_at_text = created_at_dt.strftime("%Y/%m/%d")
+
+        display_name = resolve_display_name(event_source, user_id)
+        lines.append(f"ID：{record_id}　日期：{created_at_text}")
+        lines.append(f"項目：{item}")
+        lines.append(f"金額：{amount}　登記人：{display_name}")
+        lines.append("-")
+
+    return "\n".join(lines)
+
+
+def parse_query_command(text):
+    parts = text.split()
+    if not parts or parts[0] != "@記帳":
+        return None
+
+    if len(parts) >= 2 and parts[1] in {"查詢", "總覽", "餘額", "查餘額"}:
+        range_spec = parse_range_spec(parts[2:], "全部")
+        return "summary", range_spec
+
+    if len(parts) >= 2 and parts[1] in {"範圍查詢"}:
+        range_spec = parse_month_range_spec(parts[2:])
+        return "summary", range_spec
+
+    if len(parts) >= 2 and parts[1] in {"詳細查詢", "明細", "詳細"}:
+        range_spec = parse_range_spec(parts[2:], "月")
+        return "detail", range_spec
+
+    return None
+
+
+init_db()
+
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    # get X-Line-Signature header value
+    signature = request.headers["X-Line-Signature"]
+
+    # get request body as text
+    body = request.get_data(as_text=True)
+    app.logger.info("Request body: " + body)
+
+    # handle webhook body
+    try:
+        line_handler.handle(body, signature)
+    except InvalidSignatureError:
+        print(
+            "Invalid signature. Please check your channel access token/channel secret."
+        )
+        abort(400)
+
+    return "OK"
+
+
+@line_handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    incoming_text = event.message.text.strip()
+    chat_id = get_chat_id(event.source)
+
+    confirm_keywords = {"確定", "確認", "ok", "OK", "Ok", "好"}
+    pending_record_id = PENDING_DELETE.get(chat_id)
+    if pending_record_id is not None:
+        if incoming_text in confirm_keywords:
+            deleted_count = delete_record_by_id(chat_id, pending_record_id)
+            if deleted_count == 0:
+                reply_text = f"找不到可刪除的紀錄 ID：{pending_record_id}"
+            else:
+                reply_text = f"已刪除紀錄 ID：{pending_record_id}"
+
+            PENDING_DELETE.pop(chat_id, None)
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=reply_text)
+            )
+            return
+
+        PENDING_DELETE.pop(chat_id, None)
+
+    if not incoming_text.startswith("@記帳"):
+        return
+
+    if incoming_text in {"@記帳", "@記帳格式", "@記帳 格式"}:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n-\n刪除：\n@記帳 刪除 ID\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n-\n查詢：\n@記帳 查詢 [範圍]\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+            ),
+        )
+        return
+
+    delete_match = re.fullmatch(r"@記帳\s+刪除\s+(\d+)", incoming_text)
+    if delete_match:
+        record_id = int(delete_match.group(1))
+        record = get_record_by_id(chat_id, record_id)
+        if not record:
+            reply_text = f"找不到可刪除的紀錄 ID：{record_id}"
+        else:
+            PENDING_DELETE[chat_id] = record_id
+            reply_text = format_record_detail_for_delete(record)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    try:
+        modify_command = parse_modify_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if modify_command:
+        record_id = modify_command["record_id"]
+        old_record = get_record_by_id(chat_id, record_id)
+        if not old_record:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"找不到可修改的紀錄 ID：{record_id}"),
+            )
+            return
+
+        _, _, _, old_record_type, old_created_at = old_record
+        record_type = modify_command["record_type"] or old_record_type
+        record_datetime = (
+            modify_command["record_datetime"]
+            if modify_command["record_datetime"] is not None
+            else datetime.fromisoformat(old_created_at)
+        )
+
+        updated_count = update_record_by_id(
+            chat_id=chat_id,
+            record_id=record_id,
+            item=modify_command["item"],
+            amount=modify_command["amount"],
+            record_type=record_type,
+            created_at=record_datetime,
+        )
+        if updated_count == 0:
+            reply_text = f"找不到可修改的紀錄 ID：{record_id}"
+        else:
+            reply_text = (
+                f"已修改紀錄 ID：{record_id}\n"
+                f"類型：{record_type}\n"
+                f"項目：{modify_command['item']}\n"
+                f"金額：{modify_command['amount']}"
+            )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    try:
+        query_command = parse_query_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"{err}\n可用範圍例子：2/25、2月、2025、2月到5月"),
+        )
+        return
+
+    if query_command:
+        command_type, range_spec = query_command
+        if command_type == "summary":
+            reply_text = build_summary_text(chat_id, event.source, range_spec)
+        else:
+            reply_text = build_detail_text(chat_id, event.source, range_spec)
+
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+
+    try:
+        parsed = parse_record_message(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if not parsed:
+        return
+
+    item, amount, record_type, record_datetime = parsed
+    user_id = getattr(event.source, "user_id", "unknown")
+    save_record(
+        user_id=user_id,
+        chat_id=chat_id,
+        item=item,
+        amount=amount,
+        record_type=record_type,
+        created_at=record_datetime,
+    )
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(
+            text=f"記帳成功\n類型：{record_type}\n項目：{item}\n金額：{amount}"
+        ),
+    )
+
+
+if __name__ == "__main__":
+    debug = True
+    app.run(debug=debug)
