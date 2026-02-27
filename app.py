@@ -1,6 +1,6 @@
 import sqlite3
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 
 from flask import Flask, request, abort
@@ -27,11 +27,41 @@ def resolve_db_path():
     return "bookkeeping.db"
 
 
+def resolve_database_url():
+    for env_key in (
+        "DATABASE_URL",
+        "SUPABASE_DB_URL",
+        "SUPABASE_DATABASE_URL",
+        "POSTGRES_URL",
+        "POSTGRES_PRISMA_URL",
+        "POSTGRES_URL_NON_POOLING",
+    ):
+        env_value = os.getenv(env_key)
+        if env_value:
+            return env_value
+    return None
+
+
+APP_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def get_now():
+    return datetime.now(APP_TIMEZONE).replace(tzinfo=None, microsecond=0)
+
+
 DB_PATH = resolve_db_path()
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = resolve_database_url()
 IS_POSTGRES = bool(DATABASE_URL)
 psycopg = None
 PENDING_DELETE = {}
+
+if (
+    os.getenv("VERCEL") == "1" or os.getenv("AWS_LAMBDA_FUNCTION_NAME")
+) and not IS_POSTGRES:
+    raise RuntimeError(
+        "目前在雲端環境執行，但未設定 Postgres 連線字串。"
+        "請至少設定一個環境變數：DATABASE_URL / SUPABASE_DB_URL / POSTGRES_URL"
+    )
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
 line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
@@ -150,7 +180,7 @@ def parse_record_message(text):
         except ValueError as exc:
             raise ValueError("日期格式請用 MM/DD，例如 02/27") from exc
 
-        now = datetime.now()
+        now = get_now()
         return datetime(
             year=now.year,
             month=parsed.month,
@@ -203,7 +233,7 @@ def parse_record_message(text):
             raise ValueError(f"第{line_number}行格式錯誤，項目不可空白")
 
         record_type = "支出"
-        record_datetime = datetime.now().replace(microsecond=0)
+        record_datetime = get_now()
 
         if option_1 and not option_2:
             try:
@@ -243,7 +273,7 @@ def parse_mmdd_date_input(date_text):
     except ValueError as exc:
         raise ValueError("日期格式請用 MM/DD，例如 02/27") from exc
 
-    now = datetime.now()
+    now = get_now()
     return datetime(
         year=now.year,
         month=parsed.month,
@@ -560,7 +590,7 @@ def parse_range_spec(range_parts, default_scope):
         if date_match:
             month = int(date_match.group(1))
             day = int(date_match.group(2))
-            year = datetime.now().year
+            year = get_now().year
             try:
                 datetime(year, month, day)
             except ValueError as exc:
@@ -579,7 +609,7 @@ def parse_range_spec(range_parts, default_scope):
             month = int(month_match.group(1))
             if month < 1 or month > 12:
                 raise ValueError("月份需介於 1 到 12")
-            year = datetime.now().year
+            year = get_now().year
             return {
                 "type": "month_year",
                 "year": year,
@@ -659,7 +689,7 @@ def parse_month_range_spec(range_parts):
     if start_month > end_month:
         raise ValueError("起始月不可大於結束月")
 
-    year = datetime.now().year
+    year = get_now().year
     return {
         "type": "month_range",
         "year": year,
@@ -670,7 +700,7 @@ def parse_month_range_spec(range_parts):
 
 
 def get_scope_start_datetime(scope):
-    now = datetime.now()
+    now = get_now()
 
     if scope == "全部":
         return None
