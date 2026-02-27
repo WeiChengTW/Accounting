@@ -835,7 +835,7 @@ def build_detail_text(chat_id, event_source, range_spec):
             created_at_text = created_at_dt.strftime("%Y/%m/%d")
 
         display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"ID：{display_id}　日期：{created_at_text}")
+        lines.append(f"日期：{created_at_text}　ID：{display_id}　")
         lines.append(f"項目：{item}")
         lines.append(f"金額：{amount}　登記人：{display_name}")
         lines.append("-")
