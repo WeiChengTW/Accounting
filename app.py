@@ -271,7 +271,7 @@ def get_record_by_display_id(chat_id, display_id):
             SELECT id, item, amount, record_type, created_at
             FROM records
             WHERE chat_id = ?
-            ORDER BY id ASC
+            ORDER BY created_at DESC, id DESC
             LIMIT 1 OFFSET ?
             """,
             (chat_id, display_id - 1),
@@ -629,7 +629,11 @@ def get_detailed_records(chat_id, range_spec, limit=30):
                 (
                     SELECT COUNT(*)
                     FROM records AS seq
-                    WHERE seq.chat_id = r.chat_id AND seq.id <= r.id
+                    WHERE seq.chat_id = r.chat_id
+                      AND (
+                          seq.created_at > r.created_at
+                          OR (seq.created_at = r.created_at AND seq.id >= r.id)
+                      )
                 ) AS display_id
             FROM records AS r
             WHERE {where_clause}
