@@ -183,21 +183,111 @@ def parse_mmdd_date_input(date_text):
 
 
 def parse_modify_command(text):
+    format_error_message = (
+        "修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]，"
+        "或 @記帳 修改 ID [收支或日期]，"
+        "或 @記帳 修改 ID [項目|金額|日期|收支] 值 ...（可一次改多欄位，分隔可用空白/，/,）"
+    )
+
     parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
-    if len(parts) < 5 or parts[0] != "@記帳" or parts[1] != "修改":
+    if len(parts) < 2 or parts[0] != "@記帳" or parts[1] != "修改":
         return None
+
+    if len(parts) < 3:
+        raise ValueError(format_error_message)
 
     try:
         record_id = int(parts[2])
         if record_id <= 0:
             raise ValueError
     except ValueError as exc:
-        raise ValueError(
-            "修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]（分隔可用空白/，/,）"
-        ) from exc
+        raise ValueError(format_error_message) from exc
 
-    item = parts[3]
-    amount_text = parts[4]
+    remaining_parts = parts[3:]
+    if not remaining_parts:
+        raise ValueError(format_error_message)
+
+    if remaining_parts[0] == "更新":
+        remaining_parts = remaining_parts[1:]
+        if not remaining_parts:
+            raise ValueError(format_error_message)
+
+    keyword_map = {
+        "項目": "item",
+        "金額": "amount",
+        "日期": "date",
+        "收支": "record_type",
+        "類型": "record_type",
+    }
+
+    if len(remaining_parts) >= 2 and remaining_parts[0] in keyword_map:
+        if len(remaining_parts) % 2 != 0:
+            raise ValueError(format_error_message)
+
+        modify_data = {
+            "record_id": record_id,
+            "item": None,
+            "amount": None,
+            "record_type": None,
+            "record_datetime": None,
+        }
+
+        for index in range(0, len(remaining_parts), 2):
+            field_token = remaining_parts[index]
+            field_value = remaining_parts[index + 1]
+            if field_token not in keyword_map:
+                raise ValueError(format_error_message)
+
+            field_name = keyword_map[field_token]
+            if field_name == "item":
+                modify_data["item"] = field_value
+                continue
+
+            if field_name == "amount":
+                try:
+                    amount = int(field_value)
+                    if amount <= 0:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError("金額必須是正整數") from exc
+
+                modify_data["amount"] = amount
+                continue
+
+            if field_name == "date":
+                modify_data["record_datetime"] = parse_mmdd_date_input(field_value)
+                continue
+
+            modify_data["record_type"] = normalize_record_type_input(field_value)
+
+        return modify_data
+
+    if len(remaining_parts) == 1:
+        option = remaining_parts[0]
+        record_type = None
+        record_datetime = None
+
+        try:
+            record_type = normalize_record_type_input(option)
+        except ValueError:
+            record_datetime = parse_mmdd_date_input(option)
+
+        return {
+            "record_id": record_id,
+            "item": None,
+            "amount": None,
+            "record_type": record_type,
+            "record_datetime": record_datetime,
+        }
+
+    if len(parts) < 5:
+        raise ValueError(format_error_message)
+
+    if len(remaining_parts) < 2:
+        raise ValueError(format_error_message)
+
+    item = remaining_parts[0]
+    amount_text = remaining_parts[1]
 
     try:
         amount = int(amount_text)
@@ -206,11 +296,9 @@ def parse_modify_command(text):
     except ValueError as exc:
         raise ValueError("金額必須是正整數") from exc
 
-    option_parts = parts[5:]
+    option_parts = remaining_parts[2:]
     if len(option_parts) > 2:
-        raise ValueError(
-            "修改格式：@記帳 修改 ID 項目 金額 [收支] [日期]（分隔可用空白/，/,）"
-        )
+        raise ValueError(format_error_message)
 
     record_type = None
     record_datetime = None
@@ -690,7 +778,6 @@ def build_detail_text(chat_id, event_source, range_spec):
 
     lines = [
         f"記帳詳細（{range_spec['label']}）",
-        "每筆一段：",
     ]
 
     if not rows:
@@ -795,7 +882,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
@@ -836,7 +923,17 @@ def handle_message(event):
             )
             return
 
-        real_record_id, _, _, old_record_type, old_created_at = old_record
+        real_record_id, old_item, old_amount, old_record_type, old_created_at = (
+            old_record
+        )
+        item = (
+            modify_command["item"] if modify_command["item"] is not None else old_item
+        )
+        amount = (
+            modify_command["amount"]
+            if modify_command["amount"] is not None
+            else old_amount
+        )
         record_type = modify_command["record_type"] or old_record_type
         record_datetime = (
             modify_command["record_datetime"]
@@ -847,19 +944,21 @@ def handle_message(event):
         updated_count = update_record_by_id(
             chat_id=chat_id,
             record_id=real_record_id,
-            item=modify_command["item"],
-            amount=modify_command["amount"],
+            item=item,
+            amount=amount,
             record_type=record_type,
             created_at=record_datetime,
         )
         if updated_count == 0:
             reply_text = f"找不到可修改的紀錄 ID：{display_record_id}"
         else:
+            updated_date_text = record_datetime.strftime("%Y/%m/%d")
             reply_text = (
                 f"已修改紀錄 ID：{display_record_id}\n"
                 f"類型：{record_type}\n"
-                f"項目：{modify_command['item']}\n"
-                f"金額：{modify_command['amount']}"
+                f"項目：{item}\n"
+                f"金額：{amount}\n"
+                f"日期：{updated_date_text}"
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
