@@ -30,6 +30,9 @@ def resolve_db_path():
 def resolve_database_url():
     for env_key in (
         "DATABASE_URL",
+        "DATABASE_POSTGRES_URL",
+        "DATABASE_POSTGRES_URL_NON_POOLING",
+        "DATABASE_POSTGRES_PRISMA_URL",
         "SUPABASE_DB_URL",
         "SUPABASE_DB_URI",
         "SUPABASE_DATABASE_URL",
