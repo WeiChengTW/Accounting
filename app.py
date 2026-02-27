@@ -1,4 +1,4 @@
-import json
+import sqlite3
 import re
 from datetime import datetime, timedelta
 import os
@@ -16,18 +16,21 @@ from linebot.models import (
 app = Flask(__name__)
 
 
-def resolve_records_file_path():
-    env_records_file = os.getenv("RECORDS_FILE")
-    if env_records_file:
-        return env_records_file
+def resolve_db_path():
+    env_db_path = os.getenv("DB_PATH")
+    if env_db_path:
+        return env_db_path
 
     if os.getenv("VERCEL") == "1" or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
-        return "/tmp/accounting_records.json"
+        return "/tmp/bookkeeping.db"
 
-    return "accounting_records.json"
+    return "bookkeeping.db"
 
 
-RECORDS_FILE = resolve_records_file_path()
+DB_PATH = resolve_db_path()
+DATABASE_URL = os.getenv("DATABASE_URL")
+IS_POSTGRES = bool(DATABASE_URL)
+psycopg = None
 PENDING_DELETE = {}
 
 line_bot_api = LineBotApi(os.getenv("CHANNEL_ACCESS_TOKEN"))
@@ -35,6 +38,8 @@ line_handler = WebhookHandler(os.getenv("CHANNEL_SECRET"))
 
 
 def to_db_created_at(created_at):
+    if IS_POSTGRES:
+        return created_at
     return created_at.isoformat()
 
 
@@ -44,34 +49,87 @@ def from_db_created_at(created_at_value):
     return datetime.fromisoformat(created_at_value)
 
 
-def load_records():
-    if not os.path.exists(RECORDS_FILE):
-        return []
-
-    with open(RECORDS_FILE, "r", encoding="utf-8") as file:
-        try:
-            data = json.load(file)
-        except json.JSONDecodeError:
-            return []
-
-    if not isinstance(data, list):
-        return []
-    return data
+def adapt_query(query):
+    if IS_POSTGRES:
+        return query.replace("?", "%s")
+    return query
 
 
-def save_records(records):
-    with open(RECORDS_FILE, "w", encoding="utf-8") as file:
-        json.dump(records, file, ensure_ascii=False, indent=2)
+def run_query(query, params=(), fetch_mode=None):
+    global psycopg
+    adapted_query = adapt_query(query)
 
+    if IS_POSTGRES:
+        if psycopg is None:
+            try:
+                import importlib
 
-def get_chat_records(chat_id):
-    records = load_records()
-    return [record for record in records if record.get("chat_id") == chat_id]
+                psycopg = importlib.import_module("psycopg")
+            except ImportError as exc:
+                raise RuntimeError(
+                    "DATABASE_URL 已設定，但缺少 psycopg 套件，請安裝 requirements.txt 依賴"
+                ) from exc
+
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(adapted_query, params)
+                if fetch_mode == "one":
+                    return cur.fetchone()
+                if fetch_mode == "all":
+                    return cur.fetchall()
+                return cur.rowcount
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(adapted_query, params)
+        if fetch_mode == "one":
+            return cur.fetchone()
+        if fetch_mode == "all":
+            return cur.fetchall()
+        return cur.rowcount
 
 
 def init_db():
-    if not os.path.exists(RECORDS_FILE):
-        save_records([])
+    if IS_POSTGRES:
+        run_query(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id BIGSERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT 'unknown',
+                item TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+        run_query(
+            "ALTER TABLE records ADD COLUMN IF NOT EXISTS chat_id TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                chat_id TEXT NOT NULL DEFAULT 'unknown',
+                item TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                record_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()
+        }
+        if "chat_id" not in columns:
+            conn.execute(
+                "ALTER TABLE records ADD COLUMN chat_id TEXT NOT NULL DEFAULT 'unknown'"
+            )
 
 
 def parse_record_message(text):
@@ -353,58 +411,41 @@ def parse_delete_command(text):
 
 
 def save_record(user_id, chat_id, item, amount, record_type, created_at):
-    records = load_records()
-    next_id = max((record.get("id", 0) for record in records), default=0) + 1
-    records.append(
-        {
-            "id": next_id,
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "item": item,
-            "amount": amount,
-            "record_type": record_type,
-            "created_at": to_db_created_at(created_at),
-        }
+    run_query(
+        """
+        INSERT INTO records (user_id, chat_id, item, amount, record_type, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, chat_id, item, amount, record_type, to_db_created_at(created_at)),
     )
-    save_records(records)
 
 
 def get_record_by_id(chat_id, record_id):
-    records = load_records()
-    for record in records:
-        if record.get("chat_id") == chat_id and record.get("id") == record_id:
-            return (
-                record.get("id"),
-                record.get("item"),
-                record.get("amount"),
-                record.get("record_type"),
-                record.get("created_at"),
-            )
-    return None
+    return run_query(
+        """
+        SELECT id, item, amount, record_type, created_at
+        FROM records
+        WHERE chat_id = ? AND id = ?
+        """,
+        (chat_id, record_id),
+        fetch_mode="one",
+    )
 
 
 def get_record_by_display_id(chat_id, display_id):
     if display_id <= 0:
         return None
 
-    records = sorted(
-        get_chat_records(chat_id),
-        key=lambda record: (
-            from_db_created_at(record.get("created_at")),
-            record.get("id", 0),
-        ),
-        reverse=True,
-    )
-    if display_id > len(records):
-        return None
-
-    record = records[display_id - 1]
-    return (
-        record.get("id"),
-        record.get("item"),
-        record.get("amount"),
-        record.get("record_type"),
-        record.get("created_at"),
+    return run_query(
+        """
+        SELECT id, item, amount, record_type, created_at
+        FROM records
+        WHERE chat_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1 OFFSET ?
+        """,
+        (chat_id, display_id - 1),
+        fetch_mode="one",
     )
 
 
@@ -423,26 +464,21 @@ def format_record_detail_for_delete(display_id, record_row):
 
 
 def delete_record_by_id(chat_id, record_id):
-    records = load_records()
-    for index, record in enumerate(records):
-        if record.get("chat_id") == chat_id and record.get("id") == record_id:
-            records.pop(index)
-            save_records(records)
-            return 1
-    return 0
+    return run_query(
+        "DELETE FROM records WHERE chat_id = ? AND id = ?",
+        (chat_id, record_id),
+    )
 
 
 def update_record_by_id(chat_id, record_id, item, amount, record_type, created_at):
-    records = load_records()
-    for record in records:
-        if record.get("chat_id") == chat_id and record.get("id") == record_id:
-            record["item"] = item
-            record["amount"] = amount
-            record["record_type"] = record_type
-            record["created_at"] = to_db_created_at(created_at)
-            save_records(records)
-            return 1
-    return 0
+    return run_query(
+        """
+        UPDATE records
+        SET item = ?, amount = ?, record_type = ?, created_at = ?
+        WHERE chat_id = ? AND id = ?
+        """,
+        (item, amount, record_type, to_db_created_at(created_at), chat_id, record_id),
+    )
 
 
 def get_chat_id(event_source):
@@ -700,39 +736,35 @@ def get_range_start_end(range_spec):
 def get_balance_summary(chat_id, range_spec):
     range_start, range_end = get_range_start_end(range_spec)
 
-    filtered_records = []
-    for record in get_chat_records(chat_id):
-        created_at_dt = from_db_created_at(record.get("created_at"))
-        if range_start is not None and created_at_dt < range_start:
-            continue
-        if range_end is not None and created_at_dt >= range_end:
-            continue
-        filtered_records.append(record)
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(to_db_created_at(range_start))
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(to_db_created_at(range_end))
 
-    total_expense = sum(
-        int(record.get("amount", 0))
-        for record in filtered_records
-        if record.get("record_type") == "支出"
-    )
-    total_income = sum(
-        int(record.get("amount", 0))
-        for record in filtered_records
-        if record.get("record_type") == "收入"
-    )
-
-    paid_by_user = {}
-    for record in filtered_records:
-        if record.get("record_type") != "支出":
-            continue
-        user_id = record.get("user_id")
-        paid_by_user[user_id] = paid_by_user.get(user_id, 0) + int(
-            record.get("amount", 0)
-        )
-
-    paid_by_user_rows = sorted(
-        paid_by_user.items(),
-        key=lambda row: row[1],
-        reverse=True,
+    total_expense = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '支出'",
+        params,
+        fetch_mode="one",
+    )[0]
+    total_income = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '收入'",
+        params,
+        fetch_mode="one",
+    )[0]
+    paid_by_user_rows = run_query(
+        f"""
+        SELECT user_id, COALESCE(SUM(amount), 0) AS paid
+        FROM records
+        WHERE {where_clause} AND record_type = '支出'
+        GROUP BY user_id
+        ORDER BY paid DESC
+        """,
+        params,
+        fetch_mode="all",
     )
 
     return total_expense, total_income, paid_by_user_rows
@@ -741,44 +773,40 @@ def get_balance_summary(chat_id, range_spec):
 def get_detailed_records(chat_id, range_spec, limit=30):
     range_start, range_end = get_range_start_end(range_spec)
 
-    all_chat_records = sorted(
-        get_chat_records(chat_id),
-        key=lambda record: (
-            from_db_created_at(record.get("created_at")),
-            record.get("id", 0),
-        ),
-        reverse=True,
-    )
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(to_db_created_at(range_start))
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(to_db_created_at(range_end))
 
-    display_id_map = {
-        record.get("id"): index
-        for index, record in enumerate(all_chat_records, start=1)
-    }
-
-    filtered_records = []
-    for record in all_chat_records:
-        created_at_dt = from_db_created_at(record.get("created_at"))
-        if range_start is not None and created_at_dt < range_start:
-            continue
-        if range_end is not None and created_at_dt >= range_end:
-            continue
-        filtered_records.append(record)
-
-    limited_records = filtered_records[:limit]
-    rows = []
-    for record in limited_records:
-        rows.append(
+    return run_query(
+        f"""
+        SELECT
+            r.id,
+            r.created_at,
+            r.item,
+            r.amount,
+            r.user_id,
             (
-                record.get("id"),
-                record.get("created_at"),
-                record.get("item"),
-                record.get("amount"),
-                record.get("user_id"),
-                display_id_map.get(record.get("id"), 0),
-            )
-        )
-
-    return rows
+                SELECT COUNT(*)
+                FROM records AS seq
+                WHERE seq.chat_id = r.chat_id
+                  AND (
+                      seq.created_at > r.created_at
+                      OR (seq.created_at = r.created_at AND seq.id >= r.id)
+                  )
+            ) AS display_id
+        FROM records AS r
+        WHERE {where_clause}
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT ?
+        """,
+        [*params, limit],
+        fetch_mode="all",
+    )
 
 
 def build_summary_text(chat_id, event_source, range_spec):
@@ -835,7 +863,7 @@ def build_detail_text(chat_id, event_source, range_spec):
             created_at_text = created_at_dt.strftime("%Y/%m/%d")
 
         display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"ID：{display_id}　日期：{created_at_text}")
+        lines.append(f"日期：{created_at_text}　ID：{display_id}　")
         lines.append(f"項目：{item}")
         lines.append(f"金額：{amount}　登記人：{display_name}")
         lines.append("-")
