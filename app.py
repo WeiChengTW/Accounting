@@ -989,7 +989,7 @@ def build_detail_text(chat_id, event_source, range_spec):
     use_month_day_format = scope in {"日", "周", "月"}
     shown_year = None
 
-    for _, created_at, item, amount, user_id, display_id in rows:
+    for index, (_, created_at, item, amount, user_id, display_id) in enumerate(rows):
         created_at_dt = from_db_created_at(created_at)
 
         if use_month_day_format:
@@ -1002,10 +1002,13 @@ def build_detail_text(chat_id, event_source, range_spec):
             created_at_text = created_at_dt.strftime("%Y/%m/%d")
 
         display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"日期：{created_at_text}　ID：{display_id}　")
+        lines.append(f"ID：{display_id}　")
+        lines.append(f"日期：{created_at_text}")
         lines.append(f"項目：{item}")
-        lines.append(f"金額：{amount}　登記人：{display_name}")
-        lines.append("-")
+        lines.append(f"金額：{amount}")
+        lines.append(f"登記人：{display_name}")
+        if index < len(rows) - 1:
+            lines.append("-")
 
     return "\n".join(lines)
 
