@@ -22,9 +22,10 @@ HELP_TEXT = """請用以下格式：
 @記帳 項目 金額 [收支] [日期]
 （欄位分隔支援：空白 / ， / ,；支援多行輸入）
 -
-新增成員：
-@記帳 新增成員 名稱
-（手動登記成員名稱，供算錢補位顯示，例如：@記帳 新增成員 @小明）
+補款：
+@記帳 補款 名稱 金額
+（表示打指令的人補款給對方，例如：@記帳 補款 @小明 2000）
+ -
 刪除：
 @記帳 刪除 ID
 （欄位分隔支援：空白 / ， / ,）
@@ -40,26 +41,30 @@ HELP_TEXT = """請用以下格式：
 @記帳 查詢 [範圍]
 （欄位分隔支援：空白 / ， / ,）
 -
-算錢：
-@記帳 算錢 [月份]
-（預設 3 人；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4月）
--
-成員檢查：
-@記帳 成員檢查
-（顯示 API / 算錢採用成員）
--
 範圍查詢：
 @記帳 範圍查詢 起始月到結束月
 （欄位分隔支援：空白 / ， / ,）
+-
+算錢：
+@記帳 算錢 [月份]
+（預設 3 人；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4月）
 -
 詳細查詢：
 @記帳 詳細查詢 [範圍]
 （欄位分隔支援：空白 / ， / ,）
 -
-狀態：
-@記帳 狀態
-（查看目前資料庫模式）
--
+# 狀態（暫不顯示在教學）
+# @記帳 狀態
+# （查看目前資料庫模式）
+#
+# 成員檢查（暫不顯示在教學）
+# @記帳 成員檢查
+# （顯示 API / 算錢採用成員）
+#
+# 新增成員（暫不顯示在教學）
+# @記帳 新增成員 名稱
+# （手動登記成員名稱，供算錢補位顯示）
+
 範圍選項：日 / 周 / 月 / 年 / 全部
 可用範圍例子：2/25、2月、2025、2月到5月
 查詢預設範圍：月
@@ -308,6 +313,18 @@ def init_db():
             )
             """
         )
+        run_query(
+            """
+            CREATE TABLE IF NOT EXISTS settlement_payments (
+                id BIGSERIAL PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                from_user_id TEXT NOT NULL,
+                to_name TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
         return
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -340,6 +357,19 @@ def init_db():
                 member_name TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (chat_id, member_name)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settlement_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                from_user_id TEXT NOT NULL,
+                to_name TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -378,6 +408,7 @@ def parse_record_message(text):
         "刪除",
         "修改",
         "新增成員",
+        "補款",
         "查詢",
         "總覽",
         "算錢",
@@ -655,6 +686,23 @@ def parse_add_member_command(text):
     return normalize_manual_member_name(" ".join(parts[2:]))
 
 
+def parse_settlement_payment_command(text):
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
+    if len(parts) != 4 or parts[0] != "@記帳" or parts[1] != "補款":
+        return None
+
+    to_name = normalize_manual_member_name(parts[2])
+
+    try:
+        amount = int(parts[3])
+        if amount <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("補款格式：@記帳 補款 名稱 金額（金額須為正整數）") from exc
+
+    return to_name, amount
+
+
 def save_manual_member(chat_id, member_name):
     normalized_name = normalize_manual_member_name(member_name)
     created_at = to_db_created_at(get_now())
@@ -695,6 +743,40 @@ def get_manual_members(chat_id):
         fetch_mode="all",
     )
     return [row[0] for row in rows]
+
+
+def save_settlement_payment(chat_id, from_user_id, to_name, amount, created_at):
+    run_query(
+        """
+        INSERT INTO settlement_payments (chat_id, from_user_id, to_name, amount, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (chat_id, from_user_id, to_name, amount, to_db_created_at(created_at)),
+    )
+
+
+def get_settlement_payments(chat_id, range_spec):
+    range_start, range_end = get_range_start_end(range_spec)
+
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(to_db_created_at(range_start))
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(to_db_created_at(range_end))
+
+    return run_query(
+        f"""
+        SELECT from_user_id, to_name, amount
+        FROM settlement_payments
+        WHERE {where_clause}
+        ORDER BY created_at ASC
+        """,
+        params,
+        fetch_mode="all",
+    )
 
 
 def save_record(user_id, chat_id, item, amount, record_type, created_at):
@@ -1524,6 +1606,12 @@ def build_settlement_text(chat_id, event_source, range_spec):
     per_person_extra = member_extra_total / participant_count
 
     participant_ids = [user_id for user_id, _ in participant_rows]
+    participant_name_to_id = {}
+    for user_id in participant_ids:
+        display_name = get_settlement_display_name(event_source, user_id).strip()
+        if display_name:
+            participant_name_to_id[display_name] = user_id
+
     bank_withdraw_map = allocate_proportional_amounts(
         bank_reimbursement_total,
         participant_ids,
@@ -1542,8 +1630,22 @@ def build_settlement_text(chat_id, event_source, range_spec):
     for index, user_id in enumerate(participant_ids):
         target_share_map[user_id] = base_share + (1 if index < share_remainder else 0)
 
+    payment_rows = get_settlement_payments(chat_id, range_spec)
+    payment_adjust_map = {user_id: 0 for user_id in participant_ids}
+    for from_user_id, to_name, amount in payment_rows:
+        normalized_to_name = normalize_manual_member_name(to_name)
+        to_user_id = participant_name_to_id.get(normalized_to_name)
+
+        if from_user_id in payment_adjust_map and to_user_id in payment_adjust_map:
+            payment_adjust_map[from_user_id] += amount
+            payment_adjust_map[to_user_id] -= amount
+
     for user_id in participant_ids:
-        delta = after_bank_paid_map[user_id] - target_share_map[user_id]
+        delta = (
+            after_bank_paid_map[user_id]
+            - target_share_map[user_id]
+            + payment_adjust_map.get(user_id, 0)
+        )
         if delta > 0:
             creditors.append([user_id, delta])
         elif delta < 0:
@@ -1572,9 +1674,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
 
     lines.append(f"前月結餘：{previous_month_balance}")
     lines.append(f"本月收入：{total_income}")
-    lines.append(f"可用銀行資金：{available_bank_funds}")
     lines.append(f"本期總支出：{total_expense}")
-    lines.append(f"參與人數：{participant_count}")
     lines.append(f"每人最終負擔：{int(round(per_person_extra))}")
     lines.append("")
     lines.append("付款明細（代墊）：")
@@ -1600,6 +1700,13 @@ def build_settlement_text(chat_id, event_source, range_spec):
             from_name = get_settlement_display_name(event_source, from_user_id)
             to_name = get_settlement_display_name(event_source, to_user_id)
             lines.append(f"{index}. {from_name} 要給 {to_name}：{amount}")
+
+    if payment_rows:
+        lines.append("")
+        lines.append("本月已登記補款：")
+        for index, (from_user_id, to_name, amount) in enumerate(payment_rows, start=1):
+            from_name = get_settlement_display_name(event_source, from_user_id)
+            lines.append(f"{index}. {from_name} 已給 {to_name}：{amount}")
 
     return "\n".join(lines)
 
@@ -1785,6 +1892,30 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=f"已新增成員：{saved_name}"),
+        )
+        return
+
+    try:
+        settlement_payment = parse_settlement_payment_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if settlement_payment is not None:
+        to_name, amount = settlement_payment
+        save_manual_member(chat_id, to_name)
+        save_settlement_payment(
+            chat_id=chat_id,
+            from_user_id=sender_user_id,
+            to_name=to_name,
+            amount=amount,
+            created_at=get_now(),
+        )
+
+        from_name = resolve_display_name(event.source, sender_user_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"已記錄補款：{from_name} 給 {to_name} {amount}"),
         )
         return
 
