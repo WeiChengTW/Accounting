@@ -246,16 +246,6 @@ def init_db():
         run_query(
             "ALTER TABLE records ADD COLUMN IF NOT EXISTS chat_id TEXT NOT NULL DEFAULT 'unknown'"
         )
-        run_query(
-            """
-            CREATE TABLE IF NOT EXISTS chat_members (
-                chat_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                last_seen TIMESTAMP NOT NULL,
-                PRIMARY KEY (chat_id, user_id)
-            )
-            """
-        )
         return
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -280,17 +270,6 @@ def init_db():
             conn.execute(
                 "ALTER TABLE records ADD COLUMN chat_id TEXT NOT NULL DEFAULT 'unknown'"
             )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chat_members (
-                chat_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                last_seen TEXT NOT NULL,
-                PRIMARY KEY (chat_id, user_id)
-            )
-            """
-        )
 
 
 def parse_record_message(text):
@@ -658,48 +637,6 @@ def get_chat_id(event_source):
     return f"user:{user_id}"
 
 
-def upsert_chat_member(chat_id, user_id):
-    if not user_id or user_id == "unknown":
-        return
-
-    last_seen = to_db_created_at(get_now())
-    if IS_POSTGRES:
-        run_query(
-            """
-            INSERT INTO chat_members (chat_id, user_id, last_seen)
-            VALUES (?, ?, ?)
-            ON CONFLICT (chat_id, user_id)
-            DO UPDATE SET last_seen = EXCLUDED.last_seen
-            """,
-            (chat_id, user_id, last_seen),
-        )
-        return
-
-    run_query(
-        """
-        INSERT INTO chat_members (chat_id, user_id, last_seen)
-        VALUES (?, ?, ?)
-        ON CONFLICT(chat_id, user_id)
-        DO UPDATE SET last_seen = excluded.last_seen
-        """,
-        (chat_id, user_id, last_seen),
-    )
-
-
-def get_known_chat_member_ids(chat_id):
-    rows = run_query(
-        """
-        SELECT user_id
-        FROM chat_members
-        WHERE chat_id = ?
-        ORDER BY last_seen DESC
-        """,
-        (chat_id,),
-        fetch_mode="all",
-    )
-    return [row[0] for row in rows]
-
-
 def format_user_id(user_id):
     if not user_id or user_id == "unknown":
         return "未知使用者"
@@ -784,19 +721,25 @@ def get_chat_participant_sources(event_source, chat_id=None):
     room_id = getattr(event_source, "room_id", None)
 
     api_member_ids = []
-    known_member_ids = get_known_chat_member_ids(chat_id) if chat_id else []
+    api_error_message = None
 
     try:
         if source_type == "group" and group_id:
             api_member_ids = list_group_member_ids(group_id)
         elif source_type == "room" and room_id:
             api_member_ids = list_room_member_ids(room_id)
-    except LineBotApiError:
+    except LineBotApiError as exc:
         api_member_ids = []
+        status_code = getattr(exc, "status_code", None)
+        error_message = getattr(exc, "message", str(exc))
+        if status_code is not None:
+            api_error_message = f"HTTP {status_code}: {error_message}"
+        else:
+            api_error_message = str(error_message)
 
     merged_member_ids = []
     seen = set()
-    for user_id in [*api_member_ids, *known_member_ids]:
+    for user_id in api_member_ids:
         if not user_id or user_id in seen:
             continue
         merged_member_ids.append(user_id)
@@ -805,16 +748,23 @@ def get_chat_participant_sources(event_source, chat_id=None):
     if merged_member_ids:
         return {
             "api_member_ids": api_member_ids,
-            "known_member_ids": known_member_ids,
             "merged_member_ids": merged_member_ids,
+            "api_error_message": api_error_message,
+        }
+
+    if source_type in {"group", "room"}:
+        return {
+            "api_member_ids": api_member_ids,
+            "merged_member_ids": [],
+            "api_error_message": api_error_message,
         }
 
     user_id = getattr(event_source, "user_id", None)
     fallback_member_ids = [user_id] if user_id else []
     return {
         "api_member_ids": api_member_ids,
-        "known_member_ids": known_member_ids,
         "merged_member_ids": fallback_member_ids,
+        "api_error_message": api_error_message,
     }
 
 
@@ -1222,7 +1172,9 @@ def build_settlement_text(chat_id, event_source, range_spec):
     paid_by_user_rows = get_expense_by_user(chat_id, range_spec)
     paid_map = {user_id: paid for user_id, paid in paid_by_user_rows}
 
-    participant_user_ids = get_chat_participant_user_ids(event_source, chat_id)
+    participant_sources = get_chat_participant_sources(event_source, chat_id)
+    participant_user_ids = participant_sources["merged_member_ids"]
+    api_error_message = participant_sources.get("api_error_message")
     bot_user_id = get_bot_user_id()
     participant_user_ids = [
         user_id
@@ -1231,7 +1183,12 @@ def build_settlement_text(chat_id, event_source, range_spec):
     ]
 
     if not participant_user_ids:
-        participant_user_ids = list(paid_map.keys())
+        lines = [f"算錢結果（{range_spec['label']}）"]
+        lines.append("目前無法取得群組成員名單，請稍後再試")
+        if api_error_message:
+            lines.append(f"API 錯誤：{api_error_message}")
+        lines.append("請確認：LINE 官方帳號已加入該群組，且群組成員可被 API 讀取")
+        return "\n".join(lines)
 
     participant_rows = [
         (user_id, paid_map.get(user_id, 0)) for user_id in participant_user_ids
@@ -1311,8 +1268,8 @@ def build_settlement_text(chat_id, event_source, range_spec):
 def build_member_check_text(chat_id, event_source):
     participant_sources = get_chat_participant_sources(event_source, chat_id)
     api_member_ids = participant_sources["api_member_ids"]
-    known_member_ids = participant_sources["known_member_ids"]
     merged_member_ids = participant_sources["merged_member_ids"]
+    api_error_message = participant_sources.get("api_error_message")
 
     bot_user_id = get_bot_user_id()
     filtered_member_ids = [
@@ -1321,8 +1278,10 @@ def build_member_check_text(chat_id, event_source):
 
     lines = ["成員檢查"]
     lines.append(f"API 成員數：{len(api_member_ids)}")
-    lines.append(f"本地已知成員數：{len(known_member_ids)}")
     lines.append(f"算錢採用成員數（排除機器人）：{len(filtered_member_ids)}")
+    if api_error_message:
+        lines.append(f"API 錯誤：{api_error_message}")
+        lines.append("提示：請確認 LINE 官方帳號已加入群組，且群組成員可被 API 讀取")
 
     if not filtered_member_ids:
         lines.append("目前沒有可用成員名單")
@@ -1435,8 +1394,6 @@ def handle_message(event):
     incoming_text = event.message.text.strip()
     chat_id = get_chat_id(event.source)
     sender_user_id = getattr(event.source, "user_id", "unknown")
-
-    upsert_chat_member(chat_id, sender_user_id)
 
     confirm_keywords = {"確定", "確認", "ok", "OK", "Ok", "好"}
     pending_delete = PENDING_DELETE.get(chat_id)
