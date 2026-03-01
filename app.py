@@ -64,6 +64,8 @@ HELP_TEXT = """請用以下格式：
 # 新增成員（暫不顯示在教學）
 # @記帳 新增成員 名稱
 # （手動登記成員名稱，供算錢補位顯示）
+# @記帳 刪除成員 ID
+# （依成員檢查採用名單的序號刪除手動補登成員）
 
 範圍選項：日 / 周 / 月 / 年 / 全部
 可用範圍例子：2/25、2月、2025、2月到5月
@@ -406,6 +408,7 @@ def parse_record_message(text):
 
     command_keywords = {
         "刪除",
+        "刪除成員",
         "修改",
         "新增成員",
         "補款",
@@ -702,6 +705,21 @@ def parse_add_member_command(text):
     return normalize_manual_member_name(" ".join(parts[2:]))
 
 
+def parse_delete_member_command(text):
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
+    if len(parts) != 3 or parts[0] != "@記帳" or parts[1] != "刪除成員":
+        return None
+
+    try:
+        member_index = int(parts[2])
+        if member_index <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("刪除成員格式：@記帳 刪除成員 ID") from exc
+
+    return member_index
+
+
 def parse_settlement_payment_command(text):
     parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
     if len(parts) != 4 or parts[0] != "@記帳" or parts[1] != "補款":
@@ -759,6 +777,14 @@ def get_manual_members(chat_id):
         fetch_mode="all",
     )
     return [row[0] for row in rows]
+
+
+def delete_manual_member(chat_id, member_name):
+    normalized_name = normalize_manual_member_name(member_name)
+    return run_query(
+        "DELETE FROM manual_members WHERE chat_id = ? AND member_name = ?",
+        (chat_id, normalized_name),
+    )
 
 
 def save_settlement_payment(chat_id, from_user_id, to_name, amount, created_at):
@@ -1770,7 +1796,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
     return "\n".join(lines)
 
 
-def build_member_check_text(chat_id, event_source):
+def build_member_check_data(chat_id, event_source):
     participant_sources = get_chat_participant_sources(event_source, chat_id)
     api_member_ids = participant_sources["api_member_ids"]
     merged_member_ids = participant_sources["merged_member_ids"]
@@ -1790,25 +1816,76 @@ def build_member_check_text(chat_id, event_source):
         for user_id in paid_user_ids
         if user_id and user_id != bot_user_id and user_id not in filtered_member_ids
     ]
-    settlement_member_ids = [*filtered_member_ids, *supplemented_user_ids]
+
+    settlement_members = []
+    seen_display_names = set()
+
+    def append_member(user_id, source):
+        display_name = get_settlement_display_name(event_source, user_id).strip()
+        if not display_name or display_name in seen_display_names:
+            return False
+        settlement_members.append(
+            {
+                "user_id": user_id,
+                "display_name": display_name,
+                "source": source,
+            }
+        )
+        seen_display_names.add(display_name)
+        return True
+
+    for user_id in filtered_member_ids:
+        append_member(user_id, "api")
+
+    supplemented_count = 0
+    for user_id in supplemented_user_ids:
+        if append_member(user_id, "record"):
+            supplemented_count += 1
+
+    manual_added_count = 0
+    for member_name in get_manual_members(chat_id):
+        if append_member(f"__manual_{member_name}", "manual"):
+            manual_added_count += 1
+
+    return {
+        "api_member_ids": api_member_ids,
+        "api_error_message": api_error_message,
+        "settlement_members": settlement_members,
+        "supplemented_count": supplemented_count,
+        "manual_added_count": manual_added_count,
+    }
+
+
+def build_member_check_text(chat_id, event_source):
+    member_check_data = build_member_check_data(chat_id, event_source)
+    api_member_ids = member_check_data["api_member_ids"]
+    api_error_message = member_check_data.get("api_error_message")
+    settlement_members = member_check_data["settlement_members"]
+    supplemented_count = member_check_data["supplemented_count"]
+    manual_added_count = member_check_data["manual_added_count"]
 
     lines = ["成員檢查"]
     lines.append(f"API 成員數：{len(api_member_ids)}")
-    lines.append(f"算錢採用成員數（排除機器人）：{len(settlement_member_ids)}")
-    lines.append(f"本期記帳補入成員數：{len(supplemented_user_ids)}")
+    lines.append(f"算錢採用成員數（排除機器人）：{len(settlement_members)}")
+    lines.append(f"本期記帳補入成員數：{supplemented_count}")
+    lines.append(f"手動補登成員數：{manual_added_count}")
     if api_error_message:
         lines.append(f"API 錯誤：{api_error_message}")
         lines.append("提示：請確認 LINE 官方帳號已加入群組，且群組成員可被 API 讀取")
 
-    if not settlement_member_ids:
+    if not settlement_members:
         lines.append("目前沒有可用成員名單")
         return "\n".join(lines)
 
     lines.append("")
     lines.append("採用名單：")
-    for index, user_id in enumerate(settlement_member_ids, start=1):
-        display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"{index}. {display_name}")
+    for index, member in enumerate(settlement_members, start=1):
+        suffix = ""
+        if member["source"] == "manual":
+            suffix = "（補登）"
+        elif member["source"] == "record":
+            suffix = "（本期記帳）"
+        lines.append(f"{index}. {member['display_name']}{suffix}")
 
     return "\n".join(lines)
 
@@ -1828,7 +1905,7 @@ def build_detail_text(chat_id, event_source, range_spec):
     use_month_day_format = scope in {"日", "周", "月"}
     shown_year = None
 
-    for index, (_, created_at, item, amount, user_id, display_id) in enumerate(rows):
+    for index, (_, created_at, item, amount, user_id, _) in enumerate(rows, start=1):
         created_at_dt = from_db_created_at(created_at)
 
         if use_month_day_format:
@@ -1841,7 +1918,7 @@ def build_detail_text(chat_id, event_source, range_spec):
             created_at_text = created_at_dt.strftime("%Y/%m/%d")
 
         display_name = resolve_display_name(event_source, user_id)
-        lines.append(f"ID：{display_id}　")
+        lines.append(f"ID：{index}　")
         lines.append(f"日期：{created_at_text}")
         lines.append(f"項目：{item}")
         lines.append(f"金額：{amount}")
@@ -1952,6 +2029,48 @@ def handle_message(event):
             event.reply_token,
             TextSendMessage(text=f"已新增成員：{saved_name}"),
         )
+        return
+
+    try:
+        delete_member_index = parse_delete_member_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if delete_member_index is not None:
+        member_check_data = build_member_check_data(chat_id, event.source)
+        settlement_members = member_check_data["settlement_members"]
+
+        if delete_member_index > len(settlement_members):
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"找不到成員 ID：{delete_member_index}"),
+            )
+            return
+
+        target_member = settlement_members[delete_member_index - 1]
+        target_name = target_member["display_name"]
+        target_source = target_member.get("source")
+
+        if target_source != "manual":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(
+                    text=(
+                        f"成員 ID：{delete_member_index}（{target_name}）不是手動補登成員，"
+                        "無法刪除"
+                    )
+                ),
+            )
+            return
+
+        deleted_count = delete_manual_member(chat_id, target_name)
+        if deleted_count == 0:
+            reply_text = f"找不到可刪除的補登成員：{target_name}"
+        else:
+            reply_text = f"已刪除補登成員：{target_name}"
+
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
 
     try:
