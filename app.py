@@ -328,6 +328,8 @@ def parse_record_message(text):
         "查詢",
         "總覽",
         "算錢",
+        "成員檢查",
+        "成員",
         "餘額",
         "查餘額",
         "範圍查詢",
@@ -772,6 +774,11 @@ def list_room_member_ids(room_id):
 
 
 def get_chat_participant_user_ids(event_source, chat_id=None):
+    participant_sources = get_chat_participant_sources(event_source, chat_id)
+    return participant_sources["merged_member_ids"]
+
+
+def get_chat_participant_sources(event_source, chat_id=None):
     source_type = getattr(event_source, "type", None)
     group_id = getattr(event_source, "group_id", None)
     room_id = getattr(event_source, "room_id", None)
@@ -796,10 +803,19 @@ def get_chat_participant_user_ids(event_source, chat_id=None):
         seen.add(user_id)
 
     if merged_member_ids:
-        return merged_member_ids
+        return {
+            "api_member_ids": api_member_ids,
+            "known_member_ids": known_member_ids,
+            "merged_member_ids": merged_member_ids,
+        }
 
     user_id = getattr(event_source, "user_id", None)
-    return [user_id] if user_id else []
+    fallback_member_ids = [user_id] if user_id else []
+    return {
+        "api_member_ids": api_member_ids,
+        "known_member_ids": known_member_ids,
+        "merged_member_ids": fallback_member_ids,
+    }
 
 
 def normalize_scope(scope_text, default_scope):
@@ -1292,6 +1308,35 @@ def build_settlement_text(chat_id, event_source, range_spec):
     return "\n".join(lines)
 
 
+def build_member_check_text(chat_id, event_source):
+    participant_sources = get_chat_participant_sources(event_source, chat_id)
+    api_member_ids = participant_sources["api_member_ids"]
+    known_member_ids = participant_sources["known_member_ids"]
+    merged_member_ids = participant_sources["merged_member_ids"]
+
+    bot_user_id = get_bot_user_id()
+    filtered_member_ids = [
+        user_id for user_id in merged_member_ids if user_id and user_id != bot_user_id
+    ]
+
+    lines = ["成員檢查"]
+    lines.append(f"API 成員數：{len(api_member_ids)}")
+    lines.append(f"本地已知成員數：{len(known_member_ids)}")
+    lines.append(f"算錢採用成員數（排除機器人）：{len(filtered_member_ids)}")
+
+    if not filtered_member_ids:
+        lines.append("目前沒有可用成員名單")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("採用名單：")
+    for index, user_id in enumerate(filtered_member_ids, start=1):
+        display_name = resolve_display_name(event_source, user_id)
+        lines.append(f"{index}. {display_name}")
+
+    return "\n".join(lines)
+
+
 def build_detail_text(chat_id, event_source, range_spec):
     rows = get_detailed_records(chat_id, range_spec)
     scope = range_spec["scope"] if range_spec["type"] == "scope" else "全部"
@@ -1343,6 +1388,9 @@ def parse_query_command(text):
     if len(parts) >= 2 and parts[1] in {"算錢", "分帳"}:
         range_spec = parse_range_spec(parts[2:], "月")
         return "settlement", range_spec
+
+    if len(parts) >= 2 and parts[1] in {"成員檢查", "成員"}:
+        return "member_check", None
 
     if len(parts) >= 2 and parts[1] in {"範圍查詢"}:
         range_spec = parse_month_range_spec(parts[2:])
@@ -1415,7 +1463,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [範圍]\n（依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [範圍]\n（依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 本地已知 / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
@@ -1509,6 +1557,8 @@ def handle_message(event):
         command_type, range_spec = query_command
         if command_type == "status":
             reply_text = build_storage_status_text()
+        elif command_type == "member_check":
+            reply_text = build_member_check_text(chat_id, event.source)
         elif command_type == "settlement":
             reply_text = build_settlement_text(chat_id, event.source, range_spec)
         elif command_type == "summary":
