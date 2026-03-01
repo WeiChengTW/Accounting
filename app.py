@@ -1584,11 +1584,25 @@ def build_settlement_text(chat_id, event_source, range_spec):
         if user_id and user_id != bot_user_id
     ]
 
-    missing_payer_ids = [
-        user_id
-        for user_id in paid_map.keys()
-        if user_id and user_id != bot_user_id and user_id not in participant_user_ids
-    ]
+    participant_display_names = {
+        resolve_display_name(event_source, user_id).strip()
+        for user_id in participant_user_ids
+        if user_id
+    }
+
+    missing_payer_ids = []
+    for user_id in paid_map.keys():
+        if not user_id or user_id == bot_user_id or user_id in participant_user_ids:
+            continue
+
+        payer_display_name = get_settlement_display_name(event_source, user_id).strip()
+        if payer_display_name and payer_display_name in participant_display_names:
+            continue
+
+        missing_payer_ids.append(user_id)
+        if payer_display_name:
+            participant_display_names.add(payer_display_name)
+
     participant_user_ids.extend(missing_payer_ids)
 
     if not participant_user_ids:
@@ -1609,11 +1623,34 @@ def build_settlement_text(chat_id, event_source, range_spec):
     )
     missing_count = effective_participant_count - existing_participant_count
     manual_member_names = get_manual_members(chat_id)
-    for index in range(1, missing_count + 1):
-        if index <= len(manual_member_names):
-            participant_rows.append((f"__manual_{manual_member_names[index - 1]}", 0))
-        else:
-            participant_rows.append((f"__untracked_{index}", 0))
+    used_display_names = {
+        get_settlement_display_name(event_source, user_id).strip()
+        for user_id, _ in participant_rows
+    }
+    manual_index = 0
+    next_untracked_index = 1
+    for _ in range(missing_count):
+        added = False
+        while manual_index < len(manual_member_names):
+            candidate_name = manual_member_names[manual_index].strip()
+            manual_index += 1
+            if not candidate_name or candidate_name in used_display_names:
+                continue
+            participant_rows.append((f"__manual_{candidate_name}", 0))
+            used_display_names.add(candidate_name)
+            added = True
+            break
+
+        if not added:
+            while True:
+                placeholder_name = f"未記帳成員{next_untracked_index}"
+                placeholder_id = f"__untracked_{next_untracked_index}"
+                next_untracked_index += 1
+                if placeholder_name in used_display_names:
+                    continue
+                participant_rows.append((placeholder_id, 0))
+                used_display_names.add(placeholder_name)
+                break
 
     lines = [f"算錢結果（{settlement_label}）"]
     if not participant_rows:
@@ -1712,7 +1749,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
         lines.append(f"{index}. {display_name}：{bank_withdraw_map.get(user_id, 0)}")
 
     lines.append("")
-    lines.append("互補建議：")
+    lines.append("轉帳建議：")
     if member_extra_total <= 0:
         lines.append("本期由銀行資金可完全支應，無需彼此補款")
     elif not transfers:
