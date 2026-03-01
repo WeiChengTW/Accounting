@@ -1010,13 +1010,19 @@ def build_summary_text(chat_id, event_source, range_spec):
     previous_month_balance = get_balance_for_window(
         chat_id, previous_month_start, current_month_start
     )
-    balance = total_income - total_expense
+    balance = previous_month_balance + total_income - total_expense
+
+    range_type = range_spec.get("type") if range_spec else None
+    scope = range_spec.get("scope") if range_type == "scope" else None
+    is_monthly_view = range_type == "month_year" or scope == "月"
+    income_label = "本月總收入" if is_monthly_view else "總收入"
+    expense_label = "本月總支出" if is_monthly_view else "總支出"
 
     lines = [
         f"記帳總覽（{range_spec['label']}）",
         f"上個月的結餘：{previous_month_balance}",
-        f"總收入：{total_income}",
-        f"總支出：{total_expense}",
+        f"{income_label}：{total_income}",
+        f"{expense_label}：{total_expense}",
         f"目前餘額：{balance}",
         "",
         "誰目前付了多少：",
