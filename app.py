@@ -132,6 +132,7 @@ IS_SERVERLESS = os.getenv("VERCEL") == "1" or bool(
 USING_EPHEMERAL_SQLITE = IS_SERVERLESS and not IS_POSTGRES
 psycopg = None
 PENDING_DELETE = {}
+BOT_USER_ID = None
 
 if USING_EPHEMERAL_SQLITE:
     print(
@@ -665,6 +666,65 @@ def resolve_display_name(event_source, user_id):
         return format_user_id(user_id)
 
 
+def get_bot_user_id():
+    global BOT_USER_ID
+    if BOT_USER_ID:
+        return BOT_USER_ID
+
+    try:
+        bot_info = line_bot_api.get_bot_info()
+        BOT_USER_ID = getattr(bot_info, "user_id", None)
+    except LineBotApiError:
+        BOT_USER_ID = None
+
+    return BOT_USER_ID
+
+
+def list_group_member_ids(group_id):
+    member_ids = []
+    start = None
+
+    while True:
+        response = line_bot_api.get_group_member_ids(group_id, start)
+        member_ids.extend(getattr(response, "member_ids", []) or [])
+        start = getattr(response, "next", None)
+        if not start:
+            break
+
+    return member_ids
+
+
+def list_room_member_ids(room_id):
+    member_ids = []
+    start = None
+
+    while True:
+        response = line_bot_api.get_room_member_ids(room_id, start)
+        member_ids.extend(getattr(response, "member_ids", []) or [])
+        start = getattr(response, "next", None)
+        if not start:
+            break
+
+    return member_ids
+
+
+def get_chat_participant_user_ids(event_source):
+    source_type = getattr(event_source, "type", None)
+    group_id = getattr(event_source, "group_id", None)
+    room_id = getattr(event_source, "room_id", None)
+
+    try:
+        if source_type == "group" and group_id:
+            return list_group_member_ids(group_id)
+        if source_type == "room" and room_id:
+            return list_room_member_ids(room_id)
+    except LineBotApiError:
+        return []
+
+    user_id = getattr(event_source, "user_id", None)
+    return [user_id] if user_id else []
+
+
 def normalize_scope(scope_text, default_scope):
     if not scope_text:
         return default_scope
@@ -1067,19 +1127,39 @@ def get_expense_by_user(chat_id, range_spec):
 
 def build_settlement_text(chat_id, event_source, range_spec):
     paid_by_user_rows = get_expense_by_user(chat_id, range_spec)
+    paid_map = {user_id: paid for user_id, paid in paid_by_user_rows}
+
+    participant_user_ids = get_chat_participant_user_ids(event_source)
+    bot_user_id = get_bot_user_id()
+    participant_user_ids = [
+        user_id
+        for user_id in participant_user_ids
+        if user_id and user_id != bot_user_id
+    ]
+
+    if not participant_user_ids:
+        participant_user_ids = list(paid_map.keys())
+
+    participant_rows = [
+        (user_id, paid_map.get(user_id, 0)) for user_id in participant_user_ids
+    ]
 
     lines = [f"算錢結果（{range_spec['label']}）"]
-    if not paid_by_user_rows:
+    if not participant_rows:
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
 
-    total_expense = sum(row[1] for row in paid_by_user_rows)
-    participant_count = len(paid_by_user_rows)
+    if sum(amount for _, amount in participant_rows) == 0:
+        lines.append("該範圍尚無支出紀錄，無需算錢")
+        return "\n".join(lines)
+
+    total_expense = sum(row[1] for row in participant_rows)
+    participant_count = len(participant_rows)
     per_person = total_expense / participant_count
 
     creditors = []
     debtors = []
-    for user_id, paid in paid_by_user_rows:
+    for user_id, paid in participant_rows:
         delta = round(paid - per_person)
         if delta > 0:
             creditors.append([user_id, delta])
@@ -1113,7 +1193,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
     lines.append("")
     lines.append("付款明細：")
 
-    for index, (user_id, paid) in enumerate(paid_by_user_rows, start=1):
+    for index, (user_id, paid) in enumerate(participant_rows, start=1):
         display_name = resolve_display_name(event_source, user_id)
         lines.append(f"{index}. {display_name} 已付：{paid}")
 
