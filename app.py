@@ -1257,7 +1257,7 @@ def build_summary_text(chat_id, event_source, range_spec):
         f"{expense_label}：{total_expense}",
         f"目前餘額：{balance}",
         "",
-        "誰目前付了多少：",
+        "當月各付了多少：",
     ]
 
     if not paid_by_user_rows:
