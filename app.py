@@ -305,6 +305,7 @@ def parse_record_message(text):
         "修改",
         "查詢",
         "總覽",
+        "算錢",
         "餘額",
         "查餘額",
         "範圍查詢",
@@ -1020,7 +1021,7 @@ def build_summary_text(chat_id, event_source, range_spec):
 
     lines = [
         f"記帳總覽（{range_spec['label']}）",
-        f"上個月的結餘：{previous_month_balance}",
+        f"前月總結餘：{previous_month_balance}",
         f"{income_label}：{total_income}",
         f"{expense_label}：{total_expense}",
         f"目前餘額：{balance}",
@@ -1035,6 +1036,96 @@ def build_summary_text(chat_id, event_source, range_spec):
             user_id, paid = row
             display_name = resolve_display_name(event_source, user_id)
             lines.append(f"{index}. {display_name}：{paid}")
+
+    return "\n".join(lines)
+
+
+def get_expense_by_user(chat_id, range_spec):
+    range_start, range_end = get_range_start_end(range_spec)
+
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(to_db_created_at(range_start))
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(to_db_created_at(range_end))
+
+    return run_query(
+        f"""
+        SELECT user_id, COALESCE(SUM(amount), 0) AS paid
+        FROM records
+        WHERE {where_clause} AND record_type = '支出'
+        GROUP BY user_id
+        ORDER BY paid DESC
+        """,
+        params,
+        fetch_mode="all",
+    )
+
+
+def build_settlement_text(chat_id, event_source, range_spec):
+    paid_by_user_rows = get_expense_by_user(chat_id, range_spec)
+
+    lines = [f"算錢結果（{range_spec['label']}）"]
+    if not paid_by_user_rows:
+        lines.append("該範圍尚無支出紀錄，無需算錢")
+        return "\n".join(lines)
+
+    total_expense = sum(row[1] for row in paid_by_user_rows)
+    participant_count = len(paid_by_user_rows)
+    per_person = total_expense / participant_count
+
+    creditors = []
+    debtors = []
+    for user_id, paid in paid_by_user_rows:
+        delta = round(paid - per_person)
+        if delta > 0:
+            creditors.append([user_id, delta])
+        elif delta < 0:
+            debtors.append([user_id, -delta])
+
+    transfers = []
+    creditor_index = 0
+    debtor_index = 0
+    while creditor_index < len(creditors) and debtor_index < len(debtors):
+        creditor_user_id, creditor_need = creditors[creditor_index]
+        debtor_user_id, debtor_need = debtors[debtor_index]
+
+        amount = min(creditor_need, debtor_need)
+        if amount > 0:
+            transfers.append((debtor_user_id, creditor_user_id, amount))
+
+        creditor_need -= amount
+        debtor_need -= amount
+        creditors[creditor_index][1] = creditor_need
+        debtors[debtor_index][1] = debtor_need
+
+        if creditor_need == 0:
+            creditor_index += 1
+        if debtor_need == 0:
+            debtor_index += 1
+
+    lines.append(f"本期總支出：{total_expense}")
+    lines.append(f"參與人數：{participant_count}")
+    lines.append(f"每人應付：{int(round(per_person))}")
+    lines.append("")
+    lines.append("付款明細：")
+
+    for index, (user_id, paid) in enumerate(paid_by_user_rows, start=1):
+        display_name = resolve_display_name(event_source, user_id)
+        lines.append(f"{index}. {display_name} 已付：{paid}")
+
+    lines.append("")
+    lines.append("轉帳建議：")
+    if not transfers:
+        lines.append("目前無需互相轉帳")
+    else:
+        for index, (from_user_id, to_user_id, amount) in enumerate(transfers, start=1):
+            from_name = resolve_display_name(event_source, from_user_id)
+            to_name = resolve_display_name(event_source, to_user_id)
+            lines.append(f"{index}. {from_name} 要給 {to_name}：{amount}")
 
     return "\n".join(lines)
 
@@ -1086,6 +1177,10 @@ def parse_query_command(text):
     if len(parts) >= 2 and parts[1] in {"查詢", "總覽", "餘額", "查餘額"}:
         range_spec = parse_range_spec(parts[2:], "月")
         return "summary", range_spec
+
+    if len(parts) >= 2 and parts[1] in {"算錢", "分帳"}:
+        range_spec = parse_range_spec(parts[2:], "月")
+        return "settlement", range_spec
 
     if len(parts) >= 2 and parts[1] in {"範圍查詢"}:
         range_spec = parse_month_range_spec(parts[2:])
@@ -1155,7 +1250,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [範圍]\n（依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
@@ -1249,6 +1344,8 @@ def handle_message(event):
         command_type, range_spec = query_command
         if command_type == "status":
             reply_text = build_storage_status_text()
+        elif command_type == "settlement":
+            reply_text = build_settlement_text(chat_id, event.source, range_spec)
         elif command_type == "summary":
             reply_text = build_summary_text(chat_id, event.source, range_spec)
         else:
