@@ -909,6 +909,60 @@ def get_balance_summary(chat_id, range_spec):
     return total_expense, total_income, paid_by_user_rows
 
 
+def get_previous_month_window(range_spec):
+    now = get_now()
+
+    range_type = range_spec.get("type") if range_spec else None
+    if range_type == "month_year":
+        reference_year = range_spec["year"]
+        reference_month = range_spec["month"]
+    elif range_type == "date":
+        reference_year = range_spec["year"]
+        reference_month = range_spec["month"]
+    elif range_type == "month_range":
+        reference_year = range_spec["year"]
+        reference_month = range_spec["start_month"]
+    elif range_type == "year_exact":
+        reference_year = range_spec["year"]
+        reference_month = 1
+    else:
+        reference_year = now.year
+        reference_month = now.month
+
+    current_month_start = datetime(reference_year, reference_month, 1)
+    if reference_month == 1:
+        previous_month_start = datetime(reference_year - 1, 12, 1)
+    else:
+        previous_month_start = datetime(reference_year, reference_month - 1, 1)
+
+    return previous_month_start, current_month_start
+
+
+def get_balance_for_window(chat_id, range_start, range_end):
+    where_clause = "chat_id = ?"
+    params = [chat_id]
+
+    if range_start is not None:
+        where_clause += " AND created_at >= ?"
+        params.append(to_db_created_at(range_start))
+    if range_end is not None:
+        where_clause += " AND created_at < ?"
+        params.append(to_db_created_at(range_end))
+
+    total_expense = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '支出'",
+        params,
+        fetch_mode="one",
+    )[0]
+    total_income = run_query(
+        f"SELECT COALESCE(SUM(amount), 0) FROM records WHERE {where_clause} AND record_type = '收入'",
+        params,
+        fetch_mode="one",
+    )[0]
+
+    return total_income - total_expense
+
+
 def get_detailed_records(chat_id, range_spec, limit=30):
     range_start, range_end = get_range_start_end(range_spec)
 
@@ -952,10 +1006,15 @@ def build_summary_text(chat_id, event_source, range_spec):
     total_expense, total_income, paid_by_user_rows = get_balance_summary(
         chat_id, range_spec
     )
+    previous_month_start, current_month_start = get_previous_month_window(range_spec)
+    previous_month_balance = get_balance_for_window(
+        chat_id, previous_month_start, current_month_start
+    )
     balance = total_income - total_expense
 
     lines = [
         f"記帳總覽（{range_spec['label']}）",
+        f"上個月的結餘：{previous_month_balance}",
         f"總收入：{total_income}",
         f"總支出：{total_expense}",
         f"目前餘額：{balance}",
@@ -1019,7 +1078,7 @@ def parse_query_command(text):
         return None
 
     if len(parts) >= 2 and parts[1] in {"查詢", "總覽", "餘額", "查餘額"}:
-        range_spec = parse_range_spec(parts[2:], "全部")
+        range_spec = parse_range_spec(parts[2:], "月")
         return "summary", range_spec
 
     if len(parts) >= 2 and parts[1] in {"範圍查詢"}:
@@ -1090,7 +1149,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：全部\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
