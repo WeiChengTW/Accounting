@@ -1775,7 +1775,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
     lines.append(f"前月結餘：{previous_month_balance}")
     lines.append(f"本月收入：{total_income}")
     lines.append(f"本期總支出：{total_expense}")
-    lines.append(f"每人最終須付：{int(round(per_person_extra))}")
+    lines.append(f"每人最終須補差額：{int(round(per_person_extra))}")
     lines.append("")
     lines.append("付款明細（代墊）：")
 
