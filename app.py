@@ -19,7 +19,7 @@ app = Flask(__name__)
 
 HELP_TEXT = """請用以下格式：
 記帳：
-@記帳 項目 金額 [收支] [日期]
+@記帳 項目 金額 [收支] [日期] [@對象]
 （欄位分隔支援：空白 / ， / ,；支援多行輸入）
 -
 補款：
@@ -427,24 +427,23 @@ def parse_record_message(text):
     for line_number, line in enumerate(lines, start=1):
         if not line.startswith("@記帳"):
             raise ValueError(
-                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD]"
+                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD] [@對象]"
             )
 
         payload = line[len("@記帳") :].strip()
         fields = [field for field in re.split(r"[\s,，]+", payload) if field]
-        if len(fields) < 2 or len(fields) > 4:
+        if len(fields) < 2 or len(fields) > 5:
             raise ValueError(
-                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD]（分隔可用空白/，/,）"
+                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD] [@對象]（分隔可用空白/，/,）"
             )
 
         item = fields[0]
         amount_text = fields[1]
-        option_1 = fields[2] if len(fields) >= 3 else None
-        option_2 = fields[3] if len(fields) >= 4 else None
+        optional_fields = fields[2:]
 
         if item in command_keywords:
             raise ValueError(
-                "多行輸入僅支援記帳格式：@記帳 項目 金額 [支出或收入] [MM/DD]（分隔可用空白/，/,）"
+                "多行輸入僅支援記帳格式：@記帳 項目 金額 [支出或收入] [MM/DD] [@對象]（分隔可用空白/，/,）"
             )
 
         if not item:
@@ -452,16 +451,31 @@ def parse_record_message(text):
 
         record_type = "支出"
         record_datetime = get_now()
+        target_member_name = None
+        type_or_date_options = []
 
-        if option_1 and not option_2:
+        for optional_value in optional_fields:
+            if optional_value.startswith("@"):
+                if target_member_name is not None:
+                    raise ValueError(f"第{line_number}行格式錯誤，@對象只能填一位")
+                target_member_name = normalize_manual_member_name(optional_value)
+            else:
+                type_or_date_options.append(optional_value)
+
+        if len(type_or_date_options) > 2:
+            raise ValueError(
+                f"第{line_number}行格式錯誤，請用：@記帳 項目 金額 [支出或收入] [MM/DD] [@對象]（分隔可用空白/，/,）"
+            )
+
+        if len(type_or_date_options) == 1:
             try:
-                record_type = normalize_record_type(option_1)
+                record_type = normalize_record_type(type_or_date_options[0])
             except ValueError:
-                record_datetime = parse_mmdd_date(option_1)
+                record_datetime = parse_mmdd_date(type_or_date_options[0])
 
-        if option_1 and option_2:
-            record_type = normalize_record_type(option_1)
-            record_datetime = parse_mmdd_date(option_2)
+        if len(type_or_date_options) == 2:
+            record_type = normalize_record_type(type_or_date_options[0])
+            record_datetime = parse_mmdd_date(type_or_date_options[1])
 
         try:
             amount = int(amount_text)
@@ -472,7 +486,9 @@ def parse_record_message(text):
                 f"第{line_number}行金額錯誤，金額必須是正整數，例如：@記帳 銀行，50000 收入"
             ) from exc
 
-        parsed_records.append((item, amount, record_type, record_datetime))
+        parsed_records.append(
+            (item, amount, record_type, record_datetime, target_member_name)
+        )
 
     return parsed_records
 
@@ -874,6 +890,12 @@ def format_user_id(user_id):
 def resolve_display_name(event_source, user_id):
     if not user_id or user_id == "unknown":
         return "未知使用者"
+
+    user_id_text = str(user_id)
+    if user_id_text.startswith("__manual_"):
+        return user_id_text.replace("__manual_", "", 1)
+    if user_id_text.startswith("__untracked_"):
+        return f"未記帳成員{user_id_text.split('_')[-1]}"
 
     source_type = getattr(event_source, "type", None)
     group_id = getattr(event_source, "group_id", None)
@@ -2031,9 +2053,14 @@ def handle_message(event):
     if not parsed:
         return
 
-    for item, amount, record_type, record_datetime in parsed:
+    for item, amount, record_type, record_datetime, target_member_name in parsed:
+        record_user_id = sender_user_id
+        if target_member_name:
+            save_manual_member(chat_id, target_member_name)
+            record_user_id = f"__manual_{target_member_name}"
+
         save_record(
-            user_id=sender_user_id,
+            user_id=record_user_id,
             chat_id=chat_id,
             item=item,
             amount=amount,
@@ -2042,12 +2069,19 @@ def handle_message(event):
         )
 
     if len(parsed) == 1:
-        item, amount, record_type, _ = parsed[0]
+        item, amount, record_type, _, target_member_name = parsed[0]
         reply_text = f"記帳成功\n類型：{record_type}\n項目：{item}\n金額：{amount}"
+        if target_member_name:
+            reply_text += f"\n補登對象：{target_member_name}"
     else:
         summary_lines = [f"記帳成功（共{len(parsed)}筆）"]
-        for index, (item, amount, record_type, _) in enumerate(parsed, start=1):
-            summary_lines.append(f"{index}. {record_type} {item} {amount}")
+        for index, (item, amount, record_type, _, target_member_name) in enumerate(
+            parsed, start=1
+        ):
+            target_text = (
+                f"（補登：{target_member_name}）" if target_member_name else ""
+            )
+            summary_lines.append(f"{index}. {record_type} {item} {amount}{target_text}")
         reply_text = "\n".join(summary_lines)
 
     reply_text = with_storage_warning(reply_text)
