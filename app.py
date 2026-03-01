@@ -912,6 +912,87 @@ def parse_month_range_spec(range_parts):
     }
 
 
+def parse_settlement_month_spec(range_parts):
+    format_error_message = (
+        "算錢格式：@記帳 算錢 [人數] [月份]，例如：@記帳 算錢 3 3月"
+    )
+
+    now = get_now()
+    if not range_parts:
+        return {
+            "type": "month_year",
+            "year": now.year,
+            "month": now.month,
+            "label": f"{now.year}年{now.month}月",
+        }
+
+    if len(range_parts) == 1:
+        token = range_parts[0]
+
+        month_match = re.fullmatch(r"(\d{1,2})月", token)
+        if month_match:
+            month = int(month_match.group(1))
+            if month < 1 or month > 12:
+                raise ValueError("月份需介於 1 到 12")
+            return {
+                "type": "month_year",
+                "year": now.year,
+                "month": month,
+                "label": f"{now.year}年{month}月",
+            }
+
+        year_month_match = re.fullmatch(r"(\d{4})年(\d{1,2})月", token)
+        if year_month_match:
+            year = int(year_month_match.group(1))
+            month = int(year_month_match.group(2))
+            if month < 1 or month > 12:
+                raise ValueError("月份需介於 1 到 12")
+            return {
+                "type": "month_year",
+                "year": year,
+                "month": month,
+                "label": f"{year}年{month}月",
+            }
+
+        raise ValueError(format_error_message)
+
+    if len(range_parts) == 2:
+        month = None
+        year = None
+
+        for token in range_parts:
+            month_match = re.fullmatch(r"(\d{1,2})月", token)
+            year_match = re.fullmatch(r"(\d{4})(?:年)?", token)
+
+            if month_match:
+                month = int(month_match.group(1))
+                continue
+
+            if year_match:
+                year = int(year_match.group(1))
+                continue
+
+            raise ValueError(format_error_message)
+
+        if year is None:
+            year = now.year
+
+        if month is None:
+            raise ValueError(format_error_message)
+
+        if month < 1 or month > 12:
+            raise ValueError("月份需介於 1 到 12")
+
+        return {
+            "type": "month_year",
+            "year": year,
+            "month": month,
+            "label": f"{year}年{month}月",
+        }
+
+    raise ValueError(format_error_message)
+
+
 def get_scope_start_datetime(scope):
     now = get_now()
 
@@ -1403,7 +1484,7 @@ def parse_query_command(text):
                 raise ValueError("算錢人數需為正整數")
             range_spec_parts = range_spec_parts[1:]
 
-        range_spec = parse_range_spec(range_spec_parts, "月")
+        range_spec = parse_settlement_month_spec(range_spec_parts)
         return "settlement", {
             "range_spec": range_spec,
             "participant_count": participant_count,
@@ -1482,6 +1563,7 @@ def handle_message(event):
             event.reply_token,
             TextSendMessage(
                 text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [人數] [範圍]\n（人數預設 3；依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設人數：3\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [人數] [月份]\n（人數預設 3、人數未填以 3 人計；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4 3月）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設人數：3\n算錢預設月份：當月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
