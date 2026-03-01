@@ -1144,7 +1144,12 @@ def build_settlement_text(chat_id, event_source, range_spec):
         (user_id, paid_map.get(user_id, 0)) for user_id in participant_user_ids
     ]
 
-    lines = [f"算錢結果（{range_spec['label']}）"]
+    settlement_label = range_spec["label"]
+    if range_spec.get("type") == "scope" and range_spec.get("scope") == "月":
+        now = get_now()
+        settlement_label = f"{now.year}年{now.month}月"
+
+    lines = [f"算錢結果（{settlement_label}）"]
     if not participant_rows:
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
