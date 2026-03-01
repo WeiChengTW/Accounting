@@ -1169,6 +1169,11 @@ def get_expense_by_user(chat_id, range_spec):
 
 
 def build_settlement_text(chat_id, event_source, range_spec):
+    participant_count_input = 3
+    if isinstance(range_spec, dict) and "range_spec" in range_spec:
+        participant_count_input = range_spec.get("participant_count", 3)
+        range_spec = range_spec["range_spec"]
+
     paid_by_user_rows = get_expense_by_user(chat_id, range_spec)
     paid_map = {user_id: paid for user_id, paid in paid_by_user_rows}
 
@@ -1182,6 +1187,13 @@ def build_settlement_text(chat_id, event_source, range_spec):
         if user_id and user_id != bot_user_id
     ]
 
+    missing_payer_ids = [
+        user_id
+        for user_id in paid_map.keys()
+        if user_id and user_id != bot_user_id and user_id not in participant_user_ids
+    ]
+    participant_user_ids.extend(missing_payer_ids)
+
     if not participant_user_ids:
         lines = [f"算錢結果（{range_spec['label']}）"]
         lines.append("目前無法取得群組成員名單，請稍後再試")
@@ -1194,12 +1206,28 @@ def build_settlement_text(chat_id, event_source, range_spec):
         (user_id, paid_map.get(user_id, 0)) for user_id in participant_user_ids
     ]
 
+    existing_participant_count = len(participant_rows)
+    effective_participant_count = max(
+        participant_count_input, existing_participant_count
+    )
+    missing_count = effective_participant_count - existing_participant_count
+    for index in range(1, missing_count + 1):
+        participant_rows.append((f"__untracked_{index}", 0))
+
     settlement_label = range_spec["label"]
     if range_spec.get("type") == "scope" and range_spec.get("scope") == "月":
         now = get_now()
         settlement_label = f"{now.year}年{now.month}月"
 
     lines = [f"算錢結果（{settlement_label}）"]
+    if missing_payer_ids:
+        lines.append("⚠️API 成員名單不完整，已自動補入本期有記帳的成員")
+    if participant_count_input > existing_participant_count:
+        lines.append(f"ℹ️已依指定人數 {participant_count_input} 人計算（含未記帳成員）")
+    elif participant_count_input < existing_participant_count:
+        lines.append(
+            f"⚠️指定人數 {participant_count_input} 小於已記帳人數 {existing_participant_count}，已改用 {existing_participant_count} 人計算"
+        )
     if not participant_rows:
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
@@ -1208,7 +1236,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
 
-    total_expense = sum(row[1] for row in participant_rows)
+    total_expense = sum(paid_map.values())
     participant_count = len(participant_rows)
     per_person = total_expense / participant_count
 
@@ -1249,7 +1277,10 @@ def build_settlement_text(chat_id, event_source, range_spec):
     lines.append("付款明細：")
 
     for index, (user_id, paid) in enumerate(participant_rows, start=1):
-        display_name = resolve_display_name(event_source, user_id)
+        if str(user_id).startswith("__untracked_"):
+            display_name = f"未記帳成員{str(user_id).split('_')[-1]}"
+        else:
+            display_name = resolve_display_name(event_source, user_id)
         lines.append(f"{index}. {display_name} 已付：{paid}")
 
     lines.append("")
@@ -1258,8 +1289,15 @@ def build_settlement_text(chat_id, event_source, range_spec):
         lines.append("目前無需互相轉帳")
     else:
         for index, (from_user_id, to_user_id, amount) in enumerate(transfers, start=1):
-            from_name = resolve_display_name(event_source, from_user_id)
-            to_name = resolve_display_name(event_source, to_user_id)
+            if str(from_user_id).startswith("__untracked_"):
+                from_name = f"未記帳成員{str(from_user_id).split('_')[-1]}"
+            else:
+                from_name = resolve_display_name(event_source, from_user_id)
+
+            if str(to_user_id).startswith("__untracked_"):
+                to_name = f"未記帳成員{str(to_user_id).split('_')[-1]}"
+            else:
+                to_name = resolve_display_name(event_source, to_user_id)
             lines.append(f"{index}. {from_name} 要給 {to_name}：{amount}")
 
     return "\n".join(lines)
@@ -1270,26 +1308,38 @@ def build_member_check_text(chat_id, event_source):
     api_member_ids = participant_sources["api_member_ids"]
     merged_member_ids = participant_sources["merged_member_ids"]
     api_error_message = participant_sources.get("api_error_message")
+    paid_by_user_rows = get_expense_by_user(
+        chat_id,
+        parse_range_spec([], "月"),
+    )
+    paid_user_ids = [row[0] for row in paid_by_user_rows]
 
     bot_user_id = get_bot_user_id()
     filtered_member_ids = [
         user_id for user_id in merged_member_ids if user_id and user_id != bot_user_id
     ]
+    supplemented_user_ids = [
+        user_id
+        for user_id in paid_user_ids
+        if user_id and user_id != bot_user_id and user_id not in filtered_member_ids
+    ]
+    settlement_member_ids = [*filtered_member_ids, *supplemented_user_ids]
 
     lines = ["成員檢查"]
     lines.append(f"API 成員數：{len(api_member_ids)}")
-    lines.append(f"算錢採用成員數（排除機器人）：{len(filtered_member_ids)}")
+    lines.append(f"算錢採用成員數（排除機器人）：{len(settlement_member_ids)}")
+    lines.append(f"本期記帳補入成員數：{len(supplemented_user_ids)}")
     if api_error_message:
         lines.append(f"API 錯誤：{api_error_message}")
         lines.append("提示：請確認 LINE 官方帳號已加入群組，且群組成員可被 API 讀取")
 
-    if not filtered_member_ids:
+    if not settlement_member_ids:
         lines.append("目前沒有可用成員名單")
         return "\n".join(lines)
 
     lines.append("")
     lines.append("採用名單：")
-    for index, user_id in enumerate(filtered_member_ids, start=1):
+    for index, user_id in enumerate(settlement_member_ids, start=1):
         display_name = resolve_display_name(event_source, user_id)
         lines.append(f"{index}. {display_name}")
 
@@ -1345,8 +1395,19 @@ def parse_query_command(text):
         return "summary", range_spec
 
     if len(parts) >= 2 and parts[1] in {"算錢", "分帳"}:
-        range_spec = parse_range_spec(parts[2:], "月")
-        return "settlement", range_spec
+        participant_count = 3
+        range_spec_parts = parts[2:]
+        if range_spec_parts and re.fullmatch(r"\d+", range_spec_parts[0]):
+            participant_count = int(range_spec_parts[0])
+            if participant_count <= 0:
+                raise ValueError("算錢人數需為正整數")
+            range_spec_parts = range_spec_parts[1:]
+
+        range_spec = parse_range_spec(range_spec_parts, "月")
+        return "settlement", {
+            "range_spec": range_spec,
+            "participant_count": participant_count,
+        }
 
     if len(parts) >= 2 and parts[1] in {"成員檢查", "成員"}:
         return "member_check", None
@@ -1420,7 +1481,7 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [範圍]\n（依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 本地已知 / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
+                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [人數] [範圍]\n（人數預設 3；依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設人數：3\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
         return
