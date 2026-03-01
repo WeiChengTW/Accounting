@@ -191,6 +191,7 @@ IS_SERVERLESS = os.getenv("VERCEL") == "1" or bool(
 USING_EPHEMERAL_SQLITE = IS_SERVERLESS and not IS_POSTGRES
 psycopg = None
 PENDING_DELETE = {}
+LAST_DETAIL_VIEW = {}
 BOT_USER_ID = None
 
 if USING_EPHEMERAL_SQLITE:
@@ -858,6 +859,18 @@ def get_record_by_display_id(chat_id, display_id):
         (chat_id, display_id - 1),
         fetch_mode="one",
     )
+
+
+def get_record_by_last_detail_id(chat_id, display_id):
+    if display_id <= 0:
+        return None
+
+    detail_record_ids = LAST_DETAIL_VIEW.get(chat_id) or []
+    if display_id > len(detail_record_ids):
+        return None
+
+    real_record_id = detail_record_ids[display_id - 1]
+    return get_record_by_id(chat_id, real_record_id)
 
 
 def format_record_detail_for_delete(display_id, record_row):
@@ -1899,8 +1912,11 @@ def build_detail_text(chat_id, event_source, range_spec):
     ]
 
     if not rows:
+        LAST_DETAIL_VIEW.pop(chat_id, None)
         lines.append("該範圍尚無紀錄")
         return "\n".join(lines)
+
+    LAST_DETAIL_VIEW[chat_id] = [row[0] for row in rows]
 
     use_month_day_format = scope in {"日", "周", "月"}
     shown_year = None
@@ -1923,7 +1939,7 @@ def build_detail_text(chat_id, event_source, range_spec):
         lines.append(f"項目：{item}")
         lines.append(f"金額：{amount}")
         lines.append(f"登記人：{display_name}")
-        if index < len(rows) - 1:
+        if index < len(rows):
             lines.append("-")
 
     return "\n".join(lines)
@@ -2105,7 +2121,9 @@ def handle_message(event):
 
     if delete_record_id is not None:
         display_record_id = delete_record_id
-        record = get_record_by_display_id(chat_id, display_record_id)
+        record = get_record_by_last_detail_id(chat_id, display_record_id)
+        if not record:
+            record = get_record_by_display_id(chat_id, display_record_id)
         if not record:
             reply_text = f"找不到可刪除的紀錄 ID：{display_record_id}"
         else:
@@ -2125,7 +2143,9 @@ def handle_message(event):
 
     if modify_command:
         display_record_id = modify_command["record_id"]
-        old_record = get_record_by_display_id(chat_id, display_record_id)
+        old_record = get_record_by_last_detail_id(chat_id, display_record_id)
+        if not old_record:
+            old_record = get_record_by_display_id(chat_id, display_record_id)
         if not old_record:
             line_bot_api.reply_message(
                 event.reply_token,
