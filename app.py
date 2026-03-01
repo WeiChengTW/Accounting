@@ -21,6 +21,8 @@ HELP_TEXT = """請用以下格式：
 記帳：
 @記帳 項目 金額 [收支] [日期] [@對象]
 （欄位分隔支援：空白 / ， / ,；支援多行輸入）
+記帳預設：支出、當天
+記帳項目含「銀行」會自動視為 "收入"
 -
 補款：
 @記帳 補款 名稱 金額
@@ -60,7 +62,7 @@ HELP_TEXT = """請用以下格式：
 算錢固定人數：3
 算錢預設月份：當月
 詳細查詢預設範圍：月
-記帳預設：支出、當天"""
+"""
 # 狀態（暫不顯示在教學）
 # @記帳 狀態
 # （查看目前資料庫模式）
@@ -453,7 +455,7 @@ def parse_record_message(text):
         if not item:
             raise ValueError(f"第{line_number}行格式錯誤，項目不可空白")
 
-        record_type = "支出"
+        record_type = "收入" if "銀行" in item else "支出"
         record_datetime = get_now()
         target_member_name = None
         type_or_date_options = []
@@ -1773,7 +1775,7 @@ def build_settlement_text(chat_id, event_source, range_spec):
     lines.append(f"前月結餘：{previous_month_balance}")
     lines.append(f"本月收入：{total_income}")
     lines.append(f"本期總支出：{total_expense}")
-    lines.append(f"每人最終負擔：{int(round(per_person_extra))}")
+    lines.append(f"每人最終須付：{int(round(per_person_extra))}")
     lines.append("")
     lines.append("付款明細（代墊）：")
 
