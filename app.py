@@ -22,6 +22,9 @@ HELP_TEXT = """請用以下格式：
 @記帳 項目 金額 [收支] [日期]
 （欄位分隔支援：空白 / ， / ,；支援多行輸入）
 -
+新增成員：
+@記帳 新增成員 名稱
+（手動登記成員名稱，供算錢補位顯示，例如：@記帳 新增成員 @小明）
 刪除：
 @記帳 刪除 ID
 （欄位分隔支援：空白 / ， / ,）
@@ -295,6 +298,16 @@ def init_db():
         run_query(
             "ALTER TABLE records ADD COLUMN IF NOT EXISTS chat_id TEXT NOT NULL DEFAULT 'unknown'"
         )
+        run_query(
+            """
+            CREATE TABLE IF NOT EXISTS manual_members (
+                chat_id TEXT NOT NULL,
+                member_name TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (chat_id, member_name)
+            )
+            """
+        )
         return
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -319,6 +332,17 @@ def init_db():
             conn.execute(
                 "ALTER TABLE records ADD COLUMN chat_id TEXT NOT NULL DEFAULT 'unknown'"
             )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_members (
+                chat_id TEXT NOT NULL,
+                member_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, member_name)
+            )
+            """
+        )
 
 
 def parse_record_message(text):
@@ -353,6 +377,7 @@ def parse_record_message(text):
     command_keywords = {
         "刪除",
         "修改",
+        "新增成員",
         "查詢",
         "總覽",
         "算錢",
@@ -600,6 +625,76 @@ def parse_delete_command(text):
         raise ValueError("刪除格式：@記帳 刪除 ID（分隔可用空白/，/,）") from exc
 
     return record_id
+
+
+def normalize_manual_member_name(name_text):
+    if not name_text:
+        raise ValueError("新增成員格式：@記帳 新增成員 名稱")
+
+    member_name = name_text.strip()
+    if not member_name:
+        raise ValueError("新增成員格式：@記帳 新增成員 名稱")
+
+    if member_name.startswith("@"):
+        member_name = member_name[1:].strip()
+
+    if not member_name:
+        raise ValueError("新增成員格式：@記帳 新增成員 名稱")
+
+    if len(member_name) > 30:
+        raise ValueError("成員名稱請控制在 30 字以內")
+
+    return member_name
+
+
+def parse_add_member_command(text):
+    parts = [part for part in re.split(r"[\s,，]+", text.strip()) if part]
+    if len(parts) < 3 or parts[0] != "@記帳" or parts[1] != "新增成員":
+        return None
+
+    return normalize_manual_member_name(" ".join(parts[2:]))
+
+
+def save_manual_member(chat_id, member_name):
+    normalized_name = normalize_manual_member_name(member_name)
+    created_at = to_db_created_at(get_now())
+
+    if IS_POSTGRES:
+        run_query(
+            """
+            INSERT INTO manual_members (chat_id, member_name, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT (chat_id, member_name)
+            DO UPDATE SET created_at = EXCLUDED.created_at
+            """,
+            (chat_id, normalized_name, created_at),
+        )
+    else:
+        run_query(
+            """
+            INSERT INTO manual_members (chat_id, member_name, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, member_name)
+            DO UPDATE SET created_at = excluded.created_at
+            """,
+            (chat_id, normalized_name, created_at),
+        )
+
+    return normalized_name
+
+
+def get_manual_members(chat_id):
+    rows = run_query(
+        """
+        SELECT member_name
+        FROM manual_members
+        WHERE chat_id = ?
+        ORDER BY created_at DESC
+        """,
+        (chat_id,),
+        fetch_mode="all",
+    )
+    return [row[0] for row in rows]
 
 
 def save_record(user_id, chat_id, item, amount, record_type, created_at):
@@ -1339,8 +1434,12 @@ def build_settlement_text(chat_id, event_source, range_spec):
         participant_count_input, existing_participant_count
     )
     missing_count = effective_participant_count - existing_participant_count
+    manual_member_names = get_manual_members(chat_id)
     for index in range(1, missing_count + 1):
-        participant_rows.append((f"__untracked_{index}", 0))
+        if index <= len(manual_member_names):
+            participant_rows.append((f"__manual_{manual_member_names[index - 1]}", 0))
+        else:
+            participant_rows.append((f"__untracked_{index}", 0))
 
     settlement_label = range_spec["label"]
     if range_spec.get("type") == "scope" and range_spec.get("scope") == "月":
@@ -1397,7 +1496,9 @@ def build_settlement_text(chat_id, event_source, range_spec):
     lines.append("付款明細：")
 
     for index, (user_id, paid) in enumerate(participant_rows, start=1):
-        if str(user_id).startswith("__untracked_"):
+        if str(user_id).startswith("__manual_"):
+            display_name = str(user_id).replace("__manual_", "", 1)
+        elif str(user_id).startswith("__untracked_"):
             display_name = f"未記帳成員{str(user_id).split('_')[-1]}"
         else:
             display_name = resolve_display_name(event_source, user_id)
@@ -1409,12 +1510,16 @@ def build_settlement_text(chat_id, event_source, range_spec):
         lines.append("目前無需互相轉帳")
     else:
         for index, (from_user_id, to_user_id, amount) in enumerate(transfers, start=1):
-            if str(from_user_id).startswith("__untracked_"):
+            if str(from_user_id).startswith("__manual_"):
+                from_name = str(from_user_id).replace("__manual_", "", 1)
+            elif str(from_user_id).startswith("__untracked_"):
                 from_name = f"未記帳成員{str(from_user_id).split('_')[-1]}"
             else:
                 from_name = resolve_display_name(event_source, from_user_id)
 
-            if str(to_user_id).startswith("__untracked_"):
+            if str(to_user_id).startswith("__manual_"):
+                to_name = str(to_user_id).replace("__manual_", "", 1)
+            elif str(to_user_id).startswith("__untracked_"):
                 to_name = f"未記帳成員{str(to_user_id).split('_')[-1]}"
             else:
                 to_name = resolve_display_name(event_source, to_user_id)
@@ -1601,6 +1706,20 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text=HELP_TEXT),
+        )
+        return
+
+    try:
+        add_member_name = parse_add_member_command(incoming_text)
+    except ValueError as err:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=str(err)))
+        return
+
+    if add_member_name is not None:
+        saved_name = save_manual_member(chat_id, add_member_name)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"已新增成員：{saved_name}"),
         )
         return
 
