@@ -41,8 +41,8 @@ HELP_TEXT = """請用以下格式：
 （欄位分隔支援：空白 / ， / ,）
 -
 算錢：
-@記帳 算錢 [人數] [月份]
-（人數預設 3、人數未填以 3 人計；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4 3月）
+@記帳 算錢 [月份]
+（預設 3 人；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4月）
 -
 成員檢查：
 @記帳 成員檢查
@@ -63,7 +63,7 @@ HELP_TEXT = """請用以下格式：
 範圍選項：日 / 周 / 月 / 年 / 全部
 可用範圍例子：2/25、2月、2025、2月到5月
 查詢預設範圍：月
-算錢預設人數：3
+算錢固定人數：3
 算錢預設月份：當月
 詳細查詢預設範圍：月
 記帳預設：支出、當天"""
@@ -1057,7 +1057,7 @@ def parse_month_range_spec(range_parts):
 
 
 def parse_settlement_month_spec(range_parts):
-    format_error_message = "算錢格式：@記帳 算錢 [人數] [月份]，例如：@記帳 算錢 3 3月"
+    format_error_message = "算錢格式：@記帳 算錢 [月份]，例如：@記帳 算錢 4月"
 
     now = get_now()
     if not range_parts:
@@ -1070,6 +1070,18 @@ def parse_settlement_month_spec(range_parts):
 
     if len(range_parts) == 1:
         token = range_parts[0]
+
+        month_number_match = re.fullmatch(r"(\d{1,2})", token)
+        if month_number_match:
+            month = int(month_number_match.group(1))
+            if month < 1 or month > 12:
+                raise ValueError("月份需介於 1 到 12")
+            return {
+                "type": "month_year",
+                "year": now.year,
+                "month": month,
+                "label": f"{now.year}年{month}月",
+            }
 
         month_match = re.fullmatch(r"(\d{1,2})月", token)
         if month_match:
@@ -1391,14 +1403,72 @@ def get_expense_by_user(chat_id, range_spec):
     )
 
 
+def get_settlement_display_name(event_source, user_id):
+    user_id_text = str(user_id)
+    if user_id_text.startswith("__manual_"):
+        return user_id_text.replace("__manual_", "", 1)
+    if user_id_text.startswith("__untracked_"):
+        return f"未記帳成員{user_id_text.split('_')[-1]}"
+    return resolve_display_name(event_source, user_id)
+
+
+def allocate_proportional_amounts(total_amount, weighted_ids, weight_map):
+    if total_amount <= 0 or not weighted_ids:
+        return {user_id: 0 for user_id in weighted_ids}
+
+    total_weight = sum(max(weight_map.get(user_id, 0), 0) for user_id in weighted_ids)
+    if total_weight <= 0:
+        return {user_id: 0 for user_id in weighted_ids}
+
+    allocations = {}
+    fraction_rows = []
+    allocated = 0
+
+    for user_id in weighted_ids:
+        weight = max(weight_map.get(user_id, 0), 0)
+        raw_value = total_amount * weight / total_weight
+        base_value = int(raw_value)
+        allocations[user_id] = base_value
+        allocated += base_value
+        fraction_rows.append((raw_value - base_value, user_id))
+
+    remaining = total_amount - allocated
+    for _, user_id in sorted(fraction_rows, key=lambda row: row[0], reverse=True):
+        if remaining <= 0:
+            break
+        allocations[user_id] += 1
+        remaining -= 1
+
+    return allocations
+
+
 def build_settlement_text(chat_id, event_source, range_spec):
     participant_count_input = 3
-    if isinstance(range_spec, dict) and "range_spec" in range_spec:
-        participant_count_input = range_spec.get("participant_count", 3)
-        range_spec = range_spec["range_spec"]
-
     paid_by_user_rows = get_expense_by_user(chat_id, range_spec)
     paid_map = {user_id: paid for user_id, paid in paid_by_user_rows}
+    total_expense = sum(paid_map.values())
+
+    settlement_label = range_spec["label"]
+    if range_spec.get("type") == "scope" and range_spec.get("scope") == "月":
+        now = get_now()
+        settlement_label = f"{now.year}年{now.month}月"
+
+    if total_expense == 0:
+        return "\n".join(
+            [
+                f"算錢結果（{settlement_label}）",
+                "該範圍尚無支出紀錄，無需算錢",
+            ]
+        )
+
+    _, total_income, _ = get_balance_summary(chat_id, range_spec)
+    previous_month_start, current_month_start = get_previous_month_window(range_spec)
+    previous_month_balance = get_balance_for_window(
+        chat_id, previous_month_start, current_month_start
+    )
+    available_bank_funds = max(previous_month_balance + total_income, 0)
+    bank_reimbursement_total = min(total_expense, available_bank_funds)
+    member_extra_total = total_expense - bank_reimbursement_total
 
     participant_sources = get_chat_participant_sources(event_source, chat_id)
     participant_user_ids = participant_sources["merged_member_ids"]
@@ -1441,11 +1511,6 @@ def build_settlement_text(chat_id, event_source, range_spec):
         else:
             participant_rows.append((f"__untracked_{index}", 0))
 
-    settlement_label = range_spec["label"]
-    if range_spec.get("type") == "scope" and range_spec.get("scope") == "月":
-        now = get_now()
-        settlement_label = f"{now.year}年{now.month}月"
-
     lines = [f"算錢結果（{settlement_label}）"]
     if not participant_rows:
         lines.append("該範圍尚無支出紀錄，無需算錢")
@@ -1455,14 +1520,30 @@ def build_settlement_text(chat_id, event_source, range_spec):
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
 
-    total_expense = sum(paid_map.values())
     participant_count = len(participant_rows)
-    per_person = total_expense / participant_count
+    per_person_extra = member_extra_total / participant_count
+
+    participant_ids = [user_id for user_id, _ in participant_rows]
+    bank_withdraw_map = allocate_proportional_amounts(
+        bank_reimbursement_total,
+        participant_ids,
+        {user_id: paid for user_id, paid in participant_rows},
+    )
+    after_bank_paid_map = {
+        user_id: paid_map.get(user_id, 0) - bank_withdraw_map.get(user_id, 0)
+        for user_id in participant_ids
+    }
 
     creditors = []
     debtors = []
-    for user_id, paid in participant_rows:
-        delta = round(paid - per_person)
+    base_share = member_extra_total // participant_count
+    share_remainder = member_extra_total % participant_count
+    target_share_map = {}
+    for index, user_id in enumerate(participant_ids):
+        target_share_map[user_id] = base_share + (1 if index < share_remainder else 0)
+
+    for user_id in participant_ids:
+        delta = after_bank_paid_map[user_id] - target_share_map[user_id]
         if delta > 0:
             creditors.append([user_id, delta])
         elif delta < 0:
@@ -1489,40 +1570,35 @@ def build_settlement_text(chat_id, event_source, range_spec):
         if debtor_need == 0:
             debtor_index += 1
 
+    lines.append(f"前月結餘：{previous_month_balance}")
+    lines.append(f"本月收入：{total_income}")
+    lines.append(f"可用銀行資金：{available_bank_funds}")
     lines.append(f"本期總支出：{total_expense}")
     lines.append(f"參與人數：{participant_count}")
-    lines.append(f"每人應付：{int(round(per_person))}")
+    lines.append(f"每人最終負擔：{int(round(per_person_extra))}")
     lines.append("")
-    lines.append("付款明細：")
+    lines.append("付款明細（代墊）：")
 
     for index, (user_id, paid) in enumerate(participant_rows, start=1):
-        if str(user_id).startswith("__manual_"):
-            display_name = str(user_id).replace("__manual_", "", 1)
-        elif str(user_id).startswith("__untracked_"):
-            display_name = f"未記帳成員{str(user_id).split('_')[-1]}"
-        else:
-            display_name = resolve_display_name(event_source, user_id)
+        display_name = get_settlement_display_name(event_source, user_id)
         lines.append(f"{index}. {display_name} 已付：{paid}")
 
     lines.append("")
-    lines.append("轉帳建議：")
-    if not transfers:
+    lines.append("可從銀行提領：")
+    for index, (user_id, _) in enumerate(participant_rows, start=1):
+        display_name = get_settlement_display_name(event_source, user_id)
+        lines.append(f"{index}. {display_name}：{bank_withdraw_map.get(user_id, 0)}")
+
+    lines.append("")
+    lines.append("互補建議：")
+    if member_extra_total <= 0:
+        lines.append("本期由銀行資金可完全支應，無需彼此補款")
+    elif not transfers:
         lines.append("目前無需互相轉帳")
     else:
         for index, (from_user_id, to_user_id, amount) in enumerate(transfers, start=1):
-            if str(from_user_id).startswith("__manual_"):
-                from_name = str(from_user_id).replace("__manual_", "", 1)
-            elif str(from_user_id).startswith("__untracked_"):
-                from_name = f"未記帳成員{str(from_user_id).split('_')[-1]}"
-            else:
-                from_name = resolve_display_name(event_source, from_user_id)
-
-            if str(to_user_id).startswith("__manual_"):
-                to_name = str(to_user_id).replace("__manual_", "", 1)
-            elif str(to_user_id).startswith("__untracked_"):
-                to_name = f"未記帳成員{str(to_user_id).split('_')[-1]}"
-            else:
-                to_name = resolve_display_name(event_source, to_user_id)
+            from_name = get_settlement_display_name(event_source, from_user_id)
+            to_name = get_settlement_display_name(event_source, to_user_id)
             lines.append(f"{index}. {from_name} 要給 {to_name}：{amount}")
 
     return "\n".join(lines)
@@ -1620,19 +1696,8 @@ def parse_query_command(text):
         return "summary", range_spec
 
     if len(parts) >= 2 and parts[1] in {"算錢", "分帳"}:
-        participant_count = 3
-        range_spec_parts = parts[2:]
-        if range_spec_parts and re.fullmatch(r"\d+", range_spec_parts[0]):
-            participant_count = int(range_spec_parts[0])
-            if participant_count <= 0:
-                raise ValueError("算錢人數需為正整數")
-            range_spec_parts = range_spec_parts[1:]
-
-        range_spec = parse_settlement_month_spec(range_spec_parts)
-        return "settlement", {
-            "range_spec": range_spec,
-            "participant_count": participant_count,
-        }
+        range_spec = parse_settlement_month_spec(parts[2:])
+        return "settlement", range_spec
 
     if len(parts) >= 2 and parts[1] in {"成員檢查", "成員"}:
         return "member_check", None
