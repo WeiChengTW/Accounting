@@ -913,9 +913,7 @@ def parse_month_range_spec(range_parts):
 
 
 def parse_settlement_month_spec(range_parts):
-    format_error_message = (
-        "算錢格式：@記帳 算錢 [人數] [月份]，例如：@記帳 算錢 3 3月"
-    )
+    format_error_message = "算錢格式：@記帳 算錢 [人數] [月份]，例如：@記帳 算錢 3 3月"
 
     now = get_now()
     if not range_parts:
@@ -1301,14 +1299,6 @@ def build_settlement_text(chat_id, event_source, range_spec):
         settlement_label = f"{now.year}年{now.month}月"
 
     lines = [f"算錢結果（{settlement_label}）"]
-    if missing_payer_ids:
-        lines.append("⚠️API 成員名單不完整，已自動補入本期有記帳的成員")
-    if participant_count_input > existing_participant_count:
-        lines.append(f"ℹ️已依指定人數 {participant_count_input} 人計算（含未記帳成員）")
-    elif participant_count_input < existing_participant_count:
-        lines.append(
-            f"⚠️指定人數 {participant_count_input} 小於已記帳人數 {existing_participant_count}，已改用 {existing_participant_count} 人計算"
-        )
     if not participant_rows:
         lines.append("該範圍尚無支出紀錄，無需算錢")
         return "\n".join(lines)
@@ -1562,7 +1552,6 @@ def handle_message(event):
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
-                text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [人數] [範圍]\n（人數預設 3；依支出明細計算誰要給誰；欄位分隔支援：空白 / ， / ,）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設人數：3\n算錢預設範圍：月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
                 text="請用以下格式：\n記帳：\n@記帳 項目 金額 [收支] [日期]\n（欄位分隔支援：空白 / ， / ,；支援多行輸入）\n-\n刪除：\n@記帳 刪除 ID\n（欄位分隔支援：空白 / ， / ,）\n-\n修改：\n@記帳 修改 ID 項目 金額 [收支] [日期]\n@記帳 修改 ID [收支或日期]\n@記帳 修改 ID [項目|金額|日期|收支] 值\n可一次改多欄位：@記帳 修改 ID 項目 A 金額 1000 日期 2/20 收支 收入\n（欄位分隔支援：空白 / ， / ,）\n-\n查詢：\n@記帳 查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n算錢：\n@記帳 算錢 [人數] [月份]\n（人數預設 3、人數未填以 3 人計；月份未填用當月，例如：@記帳 算錢、@記帳 算錢 4、@記帳 算錢 4 3月）\n-\n成員檢查：\n@記帳 成員檢查\n（顯示 API / 算錢採用成員）\n-\n範圍查詢：\n@記帳 範圍查詢 起始月到結束月\n（欄位分隔支援：空白 / ， / ,）\n-\n詳細查詢：\n@記帳 詳細查詢 [範圍]\n（欄位分隔支援：空白 / ， / ,）\n-\n狀態：\n@記帳 狀態\n（查看目前資料庫模式）\n-\n範圍選項：日 / 周 / 月 / 年 / 全部\n可用範圍例子：2/25、2月、2025、2月到5月\n查詢預設範圍：月\n算錢預設人數：3\n算錢預設月份：當月\n詳細查詢預設範圍：月\n記帳預設：支出、當天"
             ),
         )
